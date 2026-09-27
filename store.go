@@ -11,6 +11,9 @@ var ErrBlobNotFound = errors.New("buildcache: blob not found")
 // ErrCASFailed 表示条目的版本条件写入（CAS）失败。
 var ErrCASFailed = errors.New("buildcache: entry version condition failed")
 
+// ErrNotFound 通用的"对象不存在"，用于命名空间 / 固定 / 决策等辅助元数据。
+var ErrNotFound = errors.New("buildcache: object not found")
+
 // BlobInfo 描述内容寻址存储中的一个块。
 type BlobInfo struct {
 	Digest Digest
@@ -21,7 +24,7 @@ type BlobInfo struct {
 //
 // 约定：
 //   - 块按内容摘要寻址，PutBlob 必须幂等（同摘要重复写入等同 no-op）；
-//   - SaveSession / PutEntry / DeleteEntry 必须是原子的，崩溃不得产生半写文件；
+//   - SaveSession / PutEntry / 命名空间 / 固定等元数据写必须是原子的，崩溃不得半写；
 //   - 并发安全由 Cache 层在更上层串行化保证，实现本身仍应支持并发访问
 //     （文件实现依赖原子 rename 与 O_APPEND）。
 type Store interface {
@@ -38,14 +41,38 @@ type Store interface {
 	DeleteSession(id string) error
 	ListSessions() ([]Session, error)
 
-	// ---- 已发布条目 ----
+	// ---- 命名空间（配额）----
+	SaveNamespace(ns Namespace) error
+	GetNamespace(name string) (Namespace, error)
+	ListNamespaces() ([]Namespace, error)
+	DeleteNamespace(name string) error
+
+	// ---- 已发布条目（身份为 命名空间 + 键）----
 	// PutEntry 按版本条件原子写入：
-	// wantVersion < 0 表示仅允许新建（键必须不存在）；
+	// wantVersion < 0 表示仅允许新建（该命名空间下键必须不存在）；
 	// wantVersion >=0 表示当前版本必须恰好等于 wantVersion。
 	PutEntry(e Entry, wantVersion int64) error
-	GetEntry(key string) (Entry, error)
-	DeleteEntry(key string) error
+	GetEntry(namespace, key string) (Entry, error)
+	DeleteEntry(namespace, key string) error
 	ListEntries() ([]Entry, error)
+
+	// ---- 固定租约（身份为 命名空间 + 键）----
+	SavePin(p Pin) error
+	GetPin(namespace, key string) (Pin, error)
+	DeletePin(namespace, key string) error
+	ListPins() ([]Pin, error)
+
+	// ---- 固定类请求号（幂等记录）----
+	SavePinRequest(rec PinRequest) error
+	GetPinRequest(requestID string) (PinRequest, error)
+	DeletePinRequest(requestID string) error
+	ListPinRequests() ([]PinRequest, error)
+
+	// ---- 淘汰决策（两阶段、可审计）----
+	SaveEvictionDecision(d EvictionDecision) error
+	GetEvictionDecision(id string) (EvictionDecision, error)
+	ListEvictionDecisions() ([]EvictionDecision, error)
+	DeleteEvictionDecision(id string) error
 
 	// ---- 审计 ----
 	AppendAudit(rec GCRecord) error

@@ -78,7 +78,7 @@ func TestFileStorePersistence(t *testing.T) {
 	}
 
 	// 已发布条目可读且内容完整。
-	r, err := c2.Read(key)
+	r, err := c2.Read(DefaultNamespace, key)
 	if err != nil {
 		t.Fatalf("read after restart: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestFileStoreEntryCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := digestOf([]byte("x"))
-	e := Entry{Key: "k", Version: 1, Digest: d, TotalSize: 1, PublishedAt: time.Now()}
+	e := Entry{Namespace: DefaultNamespace, Key: "k", Version: 1, Digest: d, TotalSize: 1, PublishedAt: time.Now(), LastAccessedAt: time.Now()}
 	if err := s1.PutEntry(e, -1); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestFileStoreEntryCAS(t *testing.T) {
 	if err := s1.PutEntry(e2, 1); err != nil {
 		t.Fatalf("CAS update: %v", err)
 	}
-	got, err := s1.GetEntry("k")
+	got, err := s1.GetEntry(DefaultNamespace, "k")
 	if err != nil || got.Version != 2 {
 		t.Fatalf("get = %+v, %v", got, err)
 	}
@@ -238,5 +238,155 @@ func TestFileStoreBlobIntegrity(t *testing.T) {
 	sz, err := s.BlobSize(d)
 	if err != nil || sz != int64(len(data)) {
 		t.Fatalf("size = %d, %v", sz, err)
+	}
+}
+
+// 重启后命名空间配额、固定租约（含块快照）、淘汰决策、固定请求号都必须恢复。
+func TestFileStorePinningStatePersistence(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)
+	clk := NewFakeClock(base)
+
+	data := []byte("persist pins and quota please!!") // 30
+	specs := plan(t, data, 10)
+
+	func() {
+		store, err := NewFileStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := New(store, clk, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.SetNamespaceQuota("team-a", 1234); err != nil {
+			t.Fatal(err)
+		}
+		sess, err := c.CreateSession(CreateSessionOptions{
+			Namespace: "team-a", Key: "k", FinalDigest: digestOf(data),
+			TotalSize: int64(len(data)), Chunks: specs,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sp := range specs {
+			if _, err := c.UploadChunk(sess.ID, sp.Index, data[sp.Offset:sp.Offset+sp.Size]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := c.Complete(sess.ID, CompleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Pin(PinOptions{
+			Namespace: "team-a", Key: "k", TTL: time.Hour, RequestID: "req-persist",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// 一个已提交的淘汰决策（手动建立后立刻提交，候选被删与否都应持久化）。
+		if _, err := c.PlanEviction("team-a", 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	store2, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	c2, err := New(store2, clk, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 配额恢复。
+	st, err := c2.NamespaceStatus("team-a")
+	if err != nil {
+		t.Fatalf("namespace after restart: %v", err)
+	}
+	if st.MaxBytes != 1234 || st.UsedBytes != int64(len(data)) || st.PinnedKeys != 1 {
+		t.Fatalf("namespace status after restart = %+v", st)
+	}
+
+	// 固定租约恢复：仍 active，快照块齐全。
+	pin, err := c2.GetPin("team-a", "k")
+	if err != nil {
+		t.Fatalf("pin after restart: %v", err)
+	}
+	if pin.Version != 1 || !pin.Active(clk.Now()) || len(pin.Chunks) != len(specs) {
+		t.Fatalf("pin after restart = %+v", pin)
+	}
+
+	// 请求号索引恢复：同号同参数返回原结果而非新建版本。
+	again, err := c2.Pin(PinOptions{
+		Namespace: "team-a", Key: "k", TTL: time.Hour, RequestID: "req-persist",
+	})
+	if err != nil {
+		t.Fatalf("idempotent pin replay after restart: %v", err)
+	}
+	if again.Version != 1 {
+		t.Fatalf("pin replay version = %d, want 1", again.Version)
+	}
+
+	// 固定快照仍保护块：GC 不删除任何已固定引用的块。
+	report, err := c2.CollectGarbage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.DeletedBlobs) != 0 {
+		t.Fatalf("pinned blobs deleted after restart: %+v", report.DeletedBlobs)
+	}
+
+	// 淘汰决策恢复，且新决策序号在历史最大值之后继续递增。
+	ds, err := c2.ListEvictionDecisions("team-a")
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("eviction decisions after restart = %d, %v", len(ds), err)
+	}
+	next, err := c2.PlanEviction("team-a", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ID <= ds[0].ID {
+		t.Fatalf("new decision id %s must follow %s", next.ID, ds[0].ID)
+	}
+}
+
+// 旧版（无命名空间）扁平条目文件在打开存储时迁移到默认命名空间。
+func TestFileStoreMigratesLegacyEntries(t *testing.T) {
+	dir := t.TempDir()
+	d := digestOf([]byte("legacy"))
+	// 手工写出 001 版本布局 entries/<escaped-key>.json（无 namespace 字段）。
+	old := `{
+  "key": "old/key",
+  "version": 1,
+  "digest": "` + d.String() + `",
+  "total_size": 6,
+  "chunks": [{"index":0,"size":6,"digest":"` + d.String() + `"}],
+  "published_at": "2026-01-01T00:00:00Z"
+}`
+	if err := os.MkdirAll(filepath.Join(dir, "entries"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "entries", "old%2Fkey.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("open with legacy entry: %v", err)
+	}
+	defer store.Close()
+	e, err := store.GetEntry(DefaultNamespace, "old/key")
+	if err != nil {
+		t.Fatalf("legacy entry must be readable under default namespace: %v", err)
+	}
+	if e.Namespace != DefaultNamespace || e.Version != 1 {
+		t.Fatalf("migrated entry = %+v", e)
+	}
+	// 旧扁平文件已被移走。
+	if _, err := os.Stat(filepath.Join(dir, "entries", "old%2Fkey.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy file should be removed after migration")
 	}
 }

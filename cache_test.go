@@ -78,7 +78,7 @@ func randishOrder(n int) []int {
 
 func readAll(t *testing.T, c *Cache, key string) []byte {
 	t.Helper()
-	r, err := c.Read(key)
+	r, err := c.Read(DefaultNamespace, key)
 	if err != nil {
 		t.Fatalf("read %s: %v", key, err)
 	}
@@ -117,7 +117,7 @@ func TestHappyPathOutOfOrderAndDuplicateUpload(t *testing.T) {
 	}
 
 	// 完成前读者看不到数据。
-	if _, err := c.Read(key); !errors.Is(err, ErrEntryNotFound) {
+	if _, err := c.Read(DefaultNamespace, key); !errors.Is(err, ErrEntryNotFound) {
 		t.Fatalf("want ErrEntryNotFound before complete, got %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestHappyPathOutOfOrderAndDuplicateUpload(t *testing.T) {
 	}
 
 	// 仍然不可见。
-	if _, err := c.Read(key); !errors.Is(err, ErrEntryNotFound) {
+	if _, err := c.Read(DefaultNamespace, key); !errors.Is(err, ErrEntryNotFound) {
 		t.Fatalf("data visible before complete")
 	}
 
@@ -295,7 +295,7 @@ func TestCompleteFinalDigestMismatch(t *testing.T) {
 		t.Fatalf("want complete DigestMismatchError, got %v", err)
 	}
 	// 校验失败不得发布。
-	if _, err := c.Read("k"); !errors.Is(err, ErrEntryNotFound) {
+	if _, err := c.Read(DefaultNamespace, "k"); !errors.Is(err, ErrEntryNotFound) {
 		t.Fatalf("entry must not be visible after failed complete")
 	}
 }
@@ -850,7 +850,7 @@ func TestGCConcurrentWithPublish(t *testing.T) {
 		t.Fatalf("published %d keys, want %d", len(allKeys), publishers*iterations)
 	}
 	for _, key := range allKeys {
-		r, err := c.Read(key)
+		r, err := c.Read(DefaultNamespace, key)
 		if err != nil {
 			t.Fatalf("read %s: %v", key, err)
 		}

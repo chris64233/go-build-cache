@@ -21,6 +21,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "HTTP 监听地址")
 	dataDir := flag.String("data", "./data", "持久化数据目录")
 	ttl := flag.Duration("ttl", buildcache.DefaultSessionTTL, "上传会话默认租约时长")
+	defaultQuota := flag.Int64("default-quota", 0, "默认命名空间最大可用字节数；0 表示不限")
 	gcInterval := flag.Duration("gc-interval", 10*time.Minute, "后台 GC 周期；0 表示关闭自动 GC")
 	flag.Parse()
 
@@ -31,6 +32,11 @@ func main() {
 	cache, err := buildcache.New(store, buildcache.SystemClock{}, *ttl)
 	if err != nil {
 		log.Fatalf("init cache: %v", err)
+	}
+	if *defaultQuota > 0 {
+		if _, err := cache.SetNamespaceQuota(buildcache.DefaultNamespace, *defaultQuota); err != nil {
+			log.Fatalf("set default quota: %v", err)
+		}
 	}
 	handler := buildcache.NewHandler(cache)
 
