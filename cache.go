@@ -14,8 +14,13 @@ import (
 // DefaultSessionTTL 是创建会话时未显式指定租约时长时使用的默认值。
 const DefaultSessionTTL = 15 * time.Minute
 
+// DefaultNamespace 是未显式指定命名空间时使用的命名空间名。
+const DefaultNamespace = "default"
+
 // CreateSessionOptions 是创建上传会话的参数。
 type CreateSessionOptions struct {
+	// Namespace 命名空间名；为空时使用 DefaultNamespace。命名空间必须先注册配额。
+	Namespace string
 	// Key 缓存键；FinalDigest 最终制品的预期摘要；TotalSize 制品总字节数。
 	Key         string
 	FinalDigest Digest
@@ -50,6 +55,7 @@ type GCReport struct {
 	LiveBlobCount int
 	DeletedBlobs  []DeletedBlob
 	SweptSessions []SweptSession
+	SweptPins     []SweptPin
 }
 
 // DeletedBlob 记录一个被删除的内容块及其判定原因。
@@ -78,9 +84,36 @@ type Cache struct {
 	clock Clock
 	ttl   time.Duration
 
-	mu    sync.Mutex
-	idem  map[string]string // 幂等键 -> 会话 ID
-	gcGen uint64            // GC 代次，重启后由审计日志恢复
+	mu        sync.Mutex
+	idem      map[string]string // 幂等键 -> 会话 ID
+	pinReqs   map[string]pinRequestRecord
+	accessSeq uint64 // 条目访问单调序号（即使同一时钟时刻也可区分先后）
+	gcGen     uint64 // GC 代次，重启后由审计日志恢复
+}
+
+// touchAccess 给条目盖上一次新的访问标记（时间戳 + 严格递增序号）。
+// 调用方持有 c.mu。
+func (c *Cache) touchAccess(e *Entry, now time.Time) {
+	c.accessSeq++
+	e.AccessSeq = c.accessSeq
+	if e.LastAccessedAt.Before(now) {
+		e.LastAccessedAt = now
+	}
+}
+
+// pinRequestRecord 记录固定类请求号的首次结果，用于"同号同参返回原结果"。
+// 重放表为进程内最佳努力状态（与上传幂等键一致）：重启后租约本身仍持久，
+// 只是请求号去重窗口重新开始。
+type pinRequestRecord struct {
+	op     string // pinOpAcquire / pinOpRenew / pinOpRelease
+	ns     string
+	key    string
+	exp    time.Time     // 请求中显式给出的截止时间（零值表示未给）
+	ttl    time.Duration // 请求中给出的相对时长（0 表示未给）
+	digest Digest        // pin 的预期摘要
+	ver    uint64        // renew/release 的预期版本
+	hasVer bool
+	result PinResult
 }
 
 // New 创建缓存服务。clock 为 nil 时使用 SystemClock；store 由调用方提供。
@@ -94,7 +127,10 @@ func New(store Store, clock Clock, ttl time.Duration) (*Cache, error) {
 	if ttl <= 0 {
 		ttl = DefaultSessionTTL
 	}
-	c := &Cache{store: store, clock: clock, ttl: ttl, idem: make(map[string]string)}
+	c := &Cache{
+		store: store, clock: clock, ttl: ttl,
+		idem: make(map[string]string), pinReqs: make(map[string]pinRequestRecord),
+	}
 	if err := c.restoreIndex(); err != nil {
 		return nil, err
 	}
@@ -102,13 +138,26 @@ func New(store Store, clock Clock, ttl time.Duration) (*Cache, error) {
 }
 
 func (c *Cache) restoreIndex() error {
+	// 自动提供配额不限的默认命名空间，保证"未显式指定命名空间"的调用开箱可用。
+	if _, err := c.store.GetNamespace(DefaultNamespace); err != nil {
+		if !errors.Is(err, ErrNamespaceNotFound) {
+			return fmt.Errorf("buildcache: restore default namespace: %w", err)
+		}
+		if err := c.store.SaveNamespace(Namespace{
+			Name: DefaultNamespace, MaxBytes: 0,
+			UpdatedAt: c.clock.Now(),
+		}); err != nil {
+			return err
+		}
+	}
+
 	sessions, err := c.store.ListSessions()
 	if err != nil {
 		return fmt.Errorf("buildcache: restore sessions: %w", err)
 	}
 	for _, s := range sessions {
 		if s.IdempotencyKey != "" && s.Status == SessionOpen {
-			c.idem[s.IdempotencyKey] = s.ID
+			c.idem[sessionIdemKey(s.Namespace, s.IdempotencyKey)] = s.ID
 		}
 	}
 	records, err := c.store.ListAudit()
@@ -120,7 +169,48 @@ func (c *Cache) restoreIndex() error {
 			c.gcGen = r.Generation
 		}
 	}
+	// 恢复访问序号水位，保证重启后新的访问标记不会与淘汰决定中记录的旧序号冲突。
+	entries, err := c.store.ListEntries()
+	if err != nil {
+		return fmt.Errorf("buildcache: restore entries: %w", err)
+	}
+	// 以实际条目为准重算各命名空间用量：避免"条目已写、配额元数据未及更新"
+	// 的崩溃窗口留下漂移的 UsedBytes。
+	used := make(map[string]int64)
+	for _, e := range entries {
+		if e.AccessSeq > c.accessSeq {
+			c.accessSeq = e.AccessSeq
+		}
+		used[e.Namespace] += e.TotalSize
+	}
+	namespaces, err := c.store.ListNamespaces()
+	if err != nil {
+		return fmt.Errorf("buildcache: restore namespaces: %w", err)
+	}
+	for _, ns := range namespaces {
+		if actual := used[ns.Name]; actual != ns.UsedBytes {
+			ns.UsedBytes = actual
+			if err := c.store.SaveNamespace(ns); err != nil {
+				return fmt.Errorf("buildcache: reconcile namespace %s usage: %w", ns.Name, err)
+			}
+		}
+	}
 	return nil
+}
+
+func sessionIdemKey(namespace, idem string) string { return namespace + "\x00" + idem }
+
+func (c *Cache) resolveNamespace(name string) (string, error) {
+	if name == "" {
+		name = DefaultNamespace
+	}
+	if _, err := c.store.GetNamespace(name); err != nil {
+		if errors.Is(err, ErrNamespaceNotFound) {
+			return "", fmt.Errorf("%w: %s", ErrNamespaceNotFound, name)
+		}
+		return "", err
+	}
+	return name, nil
 }
 
 // Clock 暴露统一时间来源（测试/租约判定共用）。
@@ -145,10 +235,16 @@ func (c *Cache) CreateSession(opts CreateSessionOptions) (*Session, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	namespace, err := c.resolveNamespace(opts.Namespace)
+	if err != nil {
+		return nil, err
+	}
 	now := c.clock.Now()
 
+	idemKey := ""
 	if opts.IdempotencyKey != "" {
-		if existingID, ok := c.idem[opts.IdempotencyKey]; ok {
+		idemKey = sessionIdemKey(namespace, opts.IdempotencyKey)
+		if existingID, ok := c.idem[idemKey]; ok {
 			existing, gerr := c.store.GetSession(existingID)
 			if gerr == nil && existing.Status == SessionOpen && !c.expired(existing, now) {
 				if sameParams(existing, opts) {
@@ -160,7 +256,7 @@ func (c *Cache) CreateSession(opts CreateSessionOptions) (*Session, error) {
 				}
 			}
 			// 指向的会话已失效：删除陈旧映射，允许重新创建。
-			delete(c.idem, opts.IdempotencyKey)
+			delete(c.idem, idemKey)
 		}
 	}
 
@@ -174,6 +270,7 @@ func (c *Cache) CreateSession(opts CreateSessionOptions) (*Session, error) {
 	}
 	sess := Session{
 		ID:             id,
+		Namespace:      namespace,
 		Key:            opts.Key,
 		IdempotencyKey: opts.IdempotencyKey,
 		TotalSize:      opts.TotalSize,
@@ -187,8 +284,8 @@ func (c *Cache) CreateSession(opts CreateSessionOptions) (*Session, error) {
 	if err := c.store.SaveSession(sess); err != nil {
 		return nil, err
 	}
-	if opts.IdempotencyKey != "" {
-		c.idem[opts.IdempotencyKey] = id
+	if idemKey != "" {
+		c.idem[idemKey] = id
 	}
 	return &sess, nil
 }
@@ -357,13 +454,17 @@ func (c *Cache) Complete(sessionID string, opts CompleteOptions) (*PublishResult
 		return nil, err
 	}
 	if sess.IdempotencyKey != "" {
-		delete(c.idem, sess.IdempotencyKey)
+		delete(c.idem, sessionIdemKey(sess.Namespace, sess.IdempotencyKey))
 	}
 	return result, nil
 }
 
 func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts CompleteOptions) (*PublishResult, error) {
-	existing, err := c.store.GetEntry(sess.Key)
+	ns, err := c.store.GetNamespace(sess.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := c.store.GetEntry(sess.Namespace, sess.Key)
 	switch {
 	case errors.Is(err, ErrEntryNotFound):
 		if opts.ExpectedVersion != nil && *opts.ExpectedVersion != 0 {
@@ -373,12 +474,18 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 			}
 		}
 		entry := Entry{
-			Key: sess.Key, Version: 1, Digest: sess.FinalDigest,
-			TotalSize: sess.TotalSize, Chunks: refs, PublishedAt: now,
+			Key: sess.Key, Namespace: sess.Namespace, Version: 1,
+			Digest: sess.FinalDigest, TotalSize: sess.TotalSize,
+			Chunks: refs, PublishedAt: now, LastAccessedAt: now,
+		}
+		// 配额：超限时先做两阶段 LRU 淘汰腾空间，有效固定的条目不会被选中。
+		if err := c.enforceQuotaForPublish(&ns, nil, entry.TotalSize, now); err != nil {
+			return nil, err
 		}
 		if err := c.store.PutEntry(entry, -1); err != nil {
 			return nil, err
 		}
+		c.accountPublish(&ns, nil, entry.TotalSize, now)
 		return &PublishResult{Entry: entry, Reused: false}, nil
 
 	case err != nil:
@@ -386,6 +493,11 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 
 	case existing.Digest == sess.FinalDigest:
 		// 摘要相同：直接复用现有结果，版本条件不再适用。
+		// 复用也视作一次访问，刷新最近访问时间。
+		c.touchAccess(&existing, now)
+		if err := c.store.PutEntry(existing, int64(existing.Version)); err != nil {
+			return nil, err
+		}
 		return &PublishResult{Entry: existing, Reused: true}, nil
 
 	default:
@@ -405,13 +517,18 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 			}
 		}
 		entry := Entry{
-			Key: sess.Key, Version: existing.Version + 1, Digest: sess.FinalDigest,
-			TotalSize: sess.TotalSize, Chunks: refs, PublishedAt: now,
+			Key: sess.Key, Namespace: sess.Namespace, Version: existing.Version + 1,
+			Digest: sess.FinalDigest, TotalSize: sess.TotalSize,
+			Chunks: refs, PublishedAt: now, LastAccessedAt: now,
+		}
+		// 覆盖发布同样可能改变命名空间占用（新条目可能更大），先腾配额。
+		if err := c.enforceQuotaForPublish(&ns, &existing, entry.TotalSize, now); err != nil {
+			return nil, err
 		}
 		// CAS：即使绕过本进程锁（例如共享存储），旧版本也无法覆盖新版本。
 		if err := c.store.PutEntry(entry, int64(existing.Version)); err != nil {
 			if errors.Is(err, ErrCASFailed) {
-				fresh, gerr := c.store.GetEntry(sess.Key)
+				fresh, gerr := c.store.GetEntry(sess.Namespace, sess.Key)
 				if gerr == nil {
 					return nil, &VersionConflictError{
 						Key: sess.Key, CurrentVersion: fresh.Version,
@@ -423,19 +540,48 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 			}
 			return nil, err
 		}
+		c.accountPublish(&ns, &existing, entry.TotalSize, now)
 		return &PublishResult{Entry: entry, Reused: false}, nil
 	}
 }
 
+// accountPublish 在条目已成功写入后更新命名空间用量：
+// 覆盖发布扣除旧条目字节数，新增发布加上新条目字节数。
+// 淘汰删除的条目已在 eviction 流程中扣减，二者在同一临界区不会重复计算。
+// 调用方持有 c.mu。
+func (c *Cache) accountPublish(ns *Namespace, old *Entry, newSize int64, now time.Time) {
+	ns.UsedBytes += newSize
+	if old != nil {
+		ns.UsedBytes -= old.TotalSize
+	}
+	if ns.UsedBytes < 0 {
+		ns.UsedBytes = 0
+	}
+	ns.UpdatedAt = now
+	_ = c.store.SaveNamespace(*ns)
+}
+
 // Read 按缓存键读取已发布条目。未完成/未发布的内容对读者永远不可见。
-func (c *Cache) Read(key string) (*EntryReader, error) {
+// 读取会刷新条目的最近访问时间（LRU 依据），与发布/淘汰/固定在同一临界区串行。
+func (c *Cache) Read(namespace, key string) (*EntryReader, error) {
+	if namespace == "" {
+		namespace = DefaultNamespace
+	}
 	c.mu.Lock()
-	entry, err := c.store.GetEntry(key)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	entry, err := c.store.GetEntry(namespace, key)
 	if err != nil {
 		return nil, err
 	}
+	now := c.clock.Now()
+	c.touchAccess(&entry, now)
+	_ = c.store.PutEntry(entry, int64(entry.Version))
 	return newEntryReader(c.store, entry), nil
+}
+
+// ReadDefault 使用默认命名空间读取。
+func (c *Cache) ReadDefault(key string) (*EntryReader, error) {
+	return c.Read(DefaultNamespace, key)
 }
 
 // Cancel 取消会话。已取消/重复取消按幂等处理；已完成或已过期的会话不能取消。
@@ -461,7 +607,7 @@ func (c *Cache) Cancel(sessionID string) error {
 		return err
 	}
 	if sess.IdempotencyKey != "" {
-		delete(c.idem, sess.IdempotencyKey)
+		delete(c.idem, sessionIdemKey(sess.Namespace, sess.IdempotencyKey))
 	}
 	return nil
 }
@@ -539,6 +685,35 @@ func (c *Cache) CollectGarbage() (*GCReport, error) {
 		}
 	}
 
+	// 再清除已到期 / 已解除的固定租约记录——它们不再是"有效固定"，
+	// 其快照块是否保留取决于是否仍被已发布条目或活跃会话引用。
+	pins, err := c.store.ListPins()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pins {
+		if p.Active(start) {
+			continue
+		}
+		reason := "expired"
+		if p.Released {
+			reason = "released"
+		}
+		if err := c.store.DeletePin(p.Namespace, p.Key); err != nil {
+			return nil, err
+		}
+		report.SweptPins = append(report.SweptPins,
+			SweptPin{Namespace: p.Namespace, Key: p.Key, Version: p.Version, Reason: reason})
+		if reason == "expired" {
+			if err := c.store.AppendAudit(GCRecord{
+				Time: start, Generation: gen, Action: GCPinExpired,
+				Namespace: p.Namespace, Key: p.Key, Version: p.Version,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	// ---- Mark：快照全部存活引用 ----
 	live, err := c.buildLiveSet(start)
 	if err != nil {
@@ -585,8 +760,9 @@ func (c *Cache) CollectGarbage() (*GCReport, error) {
 	report.FinishedAt = finish
 	if err := c.store.AppendAudit(GCRecord{
 		Time: finish, Generation: gen, Action: GCFinish,
-		Detail: fmt.Sprintf("live=%d deleted=%d swept_sessions=%d",
-			report.LiveBlobCount, len(report.DeletedBlobs), len(report.SweptSessions)),
+		Detail: fmt.Sprintf("live=%d deleted=%d swept_sessions=%d swept_pins=%d",
+			report.LiveBlobCount, len(report.DeletedBlobs),
+			len(report.SweptSessions), len(report.SweptPins)),
 	}); err != nil {
 		return nil, err
 	}
@@ -625,12 +801,13 @@ func (c *Cache) sweepSessionLocked(sess *Session, reason string, gen uint64) err
 	if err := c.store.DeleteSession(sess.ID); err != nil {
 		return err
 	}
-	if sess.IdempotencyKey != "" && c.idem[sess.IdempotencyKey] == sess.ID {
-		delete(c.idem, sess.IdempotencyKey)
+	ik := sessionIdemKey(sess.Namespace, sess.IdempotencyKey)
+	if sess.IdempotencyKey != "" && c.idem[ik] == sess.ID {
+		delete(c.idem, ik)
 	}
 	return c.store.AppendAudit(GCRecord{
 		Time: c.clock.Now(), Generation: gen, Action: GCSessionSwept,
-		SessionID: sess.ID, Key: sess.Key, Reason: reason,
+		SessionID: sess.ID, Namespace: sess.Namespace, Key: sess.Key, Reason: reason,
 	})
 }
 
@@ -639,7 +816,7 @@ func (c *Cache) expired(s Session, now time.Time) bool {
 }
 
 // buildLiveSet 汇总当前所有存活引用：
-// 已发布键的全部块 + 未过且 open 的活跃会话已上传块。
+// 已发布键的全部块 + 未过且 open 的活跃会话已上传块 + 有效固定租约快照中的块。
 // 调用方持有 c.mu。
 func (c *Cache) buildLiveSet(now time.Time) (map[string]struct{}, error) {
 	live := make(map[string]struct{})
@@ -664,11 +841,24 @@ func (c *Cache) buildLiveSet(now time.Time) (map[string]struct{}, error) {
 			live[rec.Digest.String()] = struct{}{}
 		}
 	}
+	pins, err := c.store.ListPins()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pins {
+		if !p.Active(now) {
+			continue
+		}
+		for _, ref := range p.Chunks {
+			live[ref.Digest.String()] = struct{}{}
+		}
+	}
 	return live, nil
 }
 
 // deathReason 返回块当前不被任何引用保护的人类可读原因；
-// 若仍被引用则返回空串。调用方持有 c.mu。
+// 若仍被引用则返回空串。引用来源：已发布条目、活跃会话、有效固定租约。
+// 调用方持有 c.mu。
 func (c *Cache) deathReason(d Digest, now time.Time) string {
 	entries, err := c.store.ListEntries()
 	if err == nil {
@@ -693,7 +883,20 @@ func (c *Cache) deathReason(d Digest, now time.Time) string {
 			}
 		}
 	}
-	return "not referenced by any published key or active session"
+	pins, err := c.store.ListPins()
+	if err == nil {
+		for _, p := range pins {
+			if !p.Active(now) {
+				continue
+			}
+			for _, ref := range p.Chunks {
+				if ref.Digest == d {
+					return ""
+				}
+			}
+		}
+	}
+	return "not referenced by any published key, active session, or active pin"
 }
 
 func (c *Cache) computeFinalDigest(sess Session) (Digest, error) {
@@ -776,7 +979,11 @@ func chunkSpecByIndex(chunks []ChunkSpec, index int) (ChunkSpec, bool) {
 }
 
 func sameParams(s Session, opts CreateSessionOptions) bool {
-	if s.Key != opts.Key || s.TotalSize != opts.TotalSize || s.FinalDigest != opts.FinalDigest {
+	ns := opts.Namespace
+	if ns == "" {
+		ns = DefaultNamespace
+	}
+	if s.Namespace != ns || s.Key != opts.Key || s.TotalSize != opts.TotalSize || s.FinalDigest != opts.FinalDigest {
 		return false
 	}
 	if len(s.Chunks) != len(opts.Chunks) {

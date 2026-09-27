@@ -10,21 +10,28 @@ import (
 
 // MemoryStore 是进程内 Store 实现，主要用于测试。
 type MemoryStore struct {
-	mu       sync.Mutex
-	blobs    map[string][]byte
-	sessions map[string]Session
-	entries  map[string]Entry
-	audit    []GCRecord
+	mu         sync.Mutex
+	blobs      map[string][]byte
+	sessions   map[string]Session
+	entries    map[string]Entry // 复合键：namespace + "\x00" + key
+	namespaces map[string]Namespace
+	pins       map[string]PinLease // 复合键：namespace + "\x00" + key
+	audit      []GCRecord
 }
 
 // NewMemoryStore 创建空的内存存储。
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		blobs:    make(map[string][]byte),
-		sessions: make(map[string]Session),
-		entries:  make(map[string]Entry),
+		blobs:      make(map[string][]byte),
+		sessions:   make(map[string]Session),
+		entries:    make(map[string]Entry),
+		namespaces: make(map[string]Namespace),
+		pins:       make(map[string]PinLease),
 	}
 }
+
+func entryMapKey(namespace, key string) string { return namespace + "\x00" + key }
+func pinMapKey(namespace, key string) string   { return namespace + "\x00" + key }
 
 func (m *MemoryStore) PutBlob(d Digest, data []byte) error {
 	if !d.Valid() {
@@ -118,7 +125,8 @@ func (m *MemoryStore) ListSessions() ([]Session, error) {
 func (m *MemoryStore) PutEntry(e Entry, wantVersion int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	existing, ok := m.entries[e.Key]
+	ek := entryMapKey(e.Namespace, e.Key)
+	existing, ok := m.entries[ek]
 	if !ok {
 		if wantVersion >= 0 {
 			return ErrCASFailed
@@ -128,24 +136,24 @@ func (m *MemoryStore) PutEntry(e Entry, wantVersion int64) error {
 			return ErrCASFailed
 		}
 	}
-	m.entries[e.Key] = e
+	m.entries[ek] = cloneEntry(e)
 	return nil
 }
 
-func (m *MemoryStore) GetEntry(key string) (Entry, error) {
+func (m *MemoryStore) GetEntry(namespace, key string) (Entry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	e, ok := m.entries[key]
+	e, ok := m.entries[entryMapKey(namespace, key)]
 	if !ok {
 		return Entry{}, ErrEntryNotFound
 	}
-	return e, nil
+	return cloneEntry(e), nil
 }
 
-func (m *MemoryStore) DeleteEntry(key string) error {
+func (m *MemoryStore) DeleteEntry(namespace, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.entries, key)
+	delete(m.entries, entryMapKey(namespace, key))
 	return nil
 }
 
@@ -154,10 +162,112 @@ func (m *MemoryStore) ListEntries() ([]Entry, error) {
 	defer m.mu.Unlock()
 	out := make([]Entry, 0, len(m.entries))
 	for _, e := range m.entries {
-		out = append(out, e)
+		out = append(out, cloneEntry(e))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out, nil
+}
+
+func (m *MemoryStore) ListNamespaceEntries(namespace string) ([]Entry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Entry
+	for _, e := range m.entries {
+		if e.Namespace == namespace {
+			out = append(out, cloneEntry(e))
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
+}
+
+// ---- 命名空间 ----
+
+func (m *MemoryStore) SaveNamespace(ns Namespace) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.namespaces[ns.Name] = ns
+	return nil
+}
+
+func (m *MemoryStore) GetNamespace(name string) (Namespace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns, ok := m.namespaces[name]
+	if !ok {
+		return Namespace{}, ErrNamespaceNotFound
+	}
+	return ns, nil
+}
+
+func (m *MemoryStore) ListNamespaces() ([]Namespace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Namespace, 0, len(m.namespaces))
+	for _, ns := range m.namespaces {
+		out = append(out, ns)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// ---- 固定租约 ----
+
+func (m *MemoryStore) SavePin(p PinLease) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pins[pinMapKey(p.Namespace, p.Key)] = clonePin(p)
+	return nil
+}
+
+func (m *MemoryStore) GetPin(namespace, key string) (PinLease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.pins[pinMapKey(namespace, key)]
+	if !ok {
+		return PinLease{}, ErrPinNotFound
+	}
+	return clonePin(p), nil
+}
+
+func (m *MemoryStore) DeletePin(namespace, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.pins, pinMapKey(namespace, key))
+	return nil
+}
+
+func (m *MemoryStore) ListPins() ([]PinLease, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]PinLease, 0, len(m.pins))
+	for _, p := range m.pins {
+		out = append(out, clonePin(p))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out, nil
+}
+
+func cloneEntry(e Entry) Entry {
+	cp := e
+	cp.Chunks = append([]ChunkRef(nil), e.Chunks...)
+	return cp
+}
+
+func clonePin(p PinLease) PinLease {
+	cp := p
+	cp.Chunks = append([]ChunkRef(nil), p.Chunks...)
+	return cp
 }
 
 func (m *MemoryStore) AppendAudit(rec GCRecord) error {

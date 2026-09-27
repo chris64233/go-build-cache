@@ -12,6 +12,14 @@ var (
 	ErrSessionNotActive = errors.New("buildcache: upload session is not open")
 	// ErrLeaseExpired 会话租约到期，所有续期/上传/完成都会被拒绝，且不会复活。
 	ErrLeaseExpired = errors.New("buildcache: upload session lease expired")
+	// ErrNamespaceNotFound 命名空间（配额）尚未注册。
+	ErrNamespaceNotFound = errors.New("buildcache: namespace not found")
+	// ErrPinNotFound 指定键上不存在固定租约。
+	ErrPinNotFound = errors.New("buildcache: pin lease not found")
+	// ErrPinExpired 固定租约已过期或已解除，不能再续租。
+	ErrPinExpired = errors.New("buildcache: pin lease expired")
+	// ErrPinned 条目受有效固定保护，不能被淘汰。
+	ErrPinned = errors.New("buildcache: entry is protected by an active pin")
 )
 
 // DigestMismatchError 表示实际计算出的摘要与声明的预期摘要不一致。
@@ -102,4 +110,71 @@ type IdempotencyConflictError struct {
 func (e *IdempotencyConflictError) Error() string {
 	return "buildcache: idempotency key " + e.IdempotencyKey +
 		" was already used with different parameters (session " + e.Existing + ")"
+}
+
+// QuotaExceededError 表示发布后命名空间用量将超过最大字节数，
+// 且在排除全部有效固定条目后，按 LRU 淘汰仍无法腾出足够空间。
+type QuotaExceededError struct {
+	Namespace string
+	MaxBytes  int64
+	UsedBytes int64 // 淘汰尝试后仍无法满足时的用量
+	NeedBytes int64 // 新发布条目字节数
+}
+
+func (e *QuotaExceededError) Error() string {
+	return "buildcache: namespace " + e.Namespace + " quota exceeded: max " +
+		itoa(e.MaxBytes) + " bytes, need " + itoa(e.NeedBytes) +
+		", reclaimable usage insufficient (used " + itoa(e.UsedBytes) + ")"
+}
+
+// PinConflictError 表示固定请求与目标条目的当前状态不匹配：
+// 条目不存在，或条目当前摘要与请求中给出的预期摘要不一致。
+type PinConflictError struct {
+	Namespace string
+	Key       string
+	Reason    string // PinMissingEntry / PinDigestMismatch
+	Want      Digest
+	Got       Digest
+}
+
+const (
+	// PinMissingEntry 固定目标不存在（尚未发布或已被淘汰）。
+	PinMissingEntry = "missing_entry"
+	// PinDigestMismatch 固定目标当前摘要与请求预期摘要不一致。
+	PinDigestMismatch = "digest_mismatch"
+)
+
+func (e *PinConflictError) Error() string {
+	switch e.Reason {
+	case PinMissingEntry:
+		return "buildcache: cannot pin " + e.Namespace + "/" + e.Key + ": entry not found"
+	default:
+		return "buildcache: cannot pin " + e.Namespace + "/" + e.Key +
+			": current digest " + e.Got.String() + " does not match expected " + e.Want.String()
+	}
+}
+
+// PinVersionConflictError 表示固定租约操作携带的版本条件与当前租约版本不一致。
+// 旧版本的续租/解除请求一律拒绝，因此不能缩短或复活更新的租约。
+type PinVersionConflictError struct {
+	Namespace       string
+	Key             string
+	CurrentVersion  uint64
+	ExpectedVersion uint64
+}
+
+func (e *PinVersionConflictError) Error() string {
+	return "buildcache: pin lease version conflict on " + e.Namespace + "/" + e.Key +
+		": expected v" + itoa(int64(e.ExpectedVersion)) +
+		", current v" + itoa(int64(e.CurrentVersion))
+}
+
+// RequestConflictError 表示请求号（request id）相同但请求内容不同：
+// 请求号只允许重放完全相同的操作，不得复用。
+type RequestConflictError struct {
+	RequestID string
+}
+
+func (e *RequestConflictError) Error() string {
+	return "buildcache: request id " + e.RequestID + " was already used with different parameters"
 }

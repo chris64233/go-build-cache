@@ -35,6 +35,7 @@ type ChunkReceipt struct {
 // Session 是分片上传会话的持久化元数据。
 type Session struct {
 	ID             string      `json:"id"`
+	Namespace      string      `json:"namespace,omitempty"`
 	Key            string      `json:"key"`
 	IdempotencyKey string      `json:"idempotency_key,omitempty"`
 	TotalSize      int64       `json:"total_size"`
@@ -58,12 +59,49 @@ type ChunkRef struct {
 
 // Entry 是一个已发布的、可被读者看到的缓存条目。
 type Entry struct {
-	Key         string     `json:"key"`
-	Version     uint64     `json:"version"`
-	Digest      Digest     `json:"digest"`
-	TotalSize   int64      `json:"total_size"`
-	Chunks      []ChunkRef `json:"chunks"`
-	PublishedAt time.Time  `json:"published_at"`
+	Key            string     `json:"key"`
+	Namespace      string     `json:"namespace,omitempty"`
+	Version        uint64     `json:"version"`
+	Digest         Digest     `json:"digest"`
+	TotalSize      int64      `json:"total_size"`
+	Chunks         []ChunkRef `json:"chunks"`
+	PublishedAt    time.Time  `json:"published_at"`
+	LastAccessedAt time.Time  `json:"last_accessed_at"`
+	// AccessSeq 每次读取严格递增，是比时间戳更可靠的"淘汰决定之后是否被访问"判据：
+	// 即使两次读取落在同一时钟时刻，序号也不同。
+	AccessSeq uint64 `json:"access_seq"`
+}
+
+// Namespace 是配额管理的单位：命名空间内的已发布条目总字节数不得超过
+// MaxBytes（0 表示不限制）。配额状态随条目发布/淘汰持久化维护。
+type Namespace struct {
+	Name      string    `json:"name"`
+	MaxBytes  int64     `json:"max_bytes"`
+	UsedBytes int64     `json:"used_bytes"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// PinLease 是针对单个已发布条目的固定租约。
+//
+// 租约带严格递增的 Version：续租（延长截止时间）与解除都会使 Version +1，
+// 因此携带旧版本号的延迟操作不可能缩短或复活新的租约。固定时刻条目的
+// 分片引用被快照到 Chunks——条目随后被覆盖发布也不会改变该租约所保护的块集合。
+type PinLease struct {
+	Namespace string     `json:"namespace"`
+	Key       string     `json:"key"`
+	Version   uint64     `json:"version"`
+	Digest    Digest     `json:"digest"`
+	Chunks    []ChunkRef `json:"chunks"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	// Released 为 true 表示租约已被显式解除；记录保留以支撑版本判定与审计，
+	// 过期扫描时统一物理清除。
+	Released bool `json:"released,omitempty"`
+}
+
+// Active 报告租约在 now 时刻是否仍提供固定保护：未解除且未过期。
+func (p PinLease) Active(now time.Time) bool {
+	return !p.Released && p.ExpiresAt.After(now)
 }
 
 // GCRecord 是垃圾回收/清理过程留下的可审计决策记录。
@@ -76,6 +114,8 @@ type GCRecord struct {
 	SessionID  string    `json:"session_id,omitempty"`
 	Reason     string    `json:"reason,omitempty"`
 	Detail     string    `json:"detail,omitempty"`
+	Namespace  string    `json:"namespace,omitempty"`
+	Version    uint64    `json:"version,omitempty"`
 }
 
 // GC 动作类型。
@@ -86,6 +126,17 @@ const (
 	GCDelete       = "blob_deleted"  // sweep 阶段删除块
 	GCSkipInUse    = "blob_skip_in_use"
 	GCFinish       = "gc_finish"
+
+	// 配额淘汰两阶段决策。
+	GCEvictSelected = "eviction_selected" // 选定淘汰候选（决策尚未执行）
+	GCEvictDeleted  = "entry_evicted"     // 候选通过确认并真正删除
+	GCEvictStale    = "eviction_stale"    // 旧淘汰决定失效（候选被访问/固定/重新发布）
+
+	// 固定租约生命周期。
+	GCPinAcquired = "pin_acquired"
+	GCPinRenewed  = "pin_renewed"
+	GCPinReleased = "pin_released"
+	GCPinExpired  = "pin_expired"
 )
 
 // 让 Digest 以 "algo:hex" 字符串形式持久化。

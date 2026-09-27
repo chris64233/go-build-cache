@@ -17,10 +17,12 @@ import (
 // FileStore 把所有状态持久化到一个目录：
 //
 //	root/
-//	  blobs/sha256/<ab>/<full-hex>   内容寻址块，临时文件 + rename 原子落盘
-//	  sessions/<id>.json             会话元数据，临时文件 + rename 原子覆盖
-//	  entries/<key-escaped>.json     已发布条目，临时文件 + rename 原子覆盖
-//	  audit.log                      追加式审计日志（O_APPEND）
+//	  blobs/sha256/<ab>/<full-hex>            内容寻址块，临时文件 + rename 原子落盘
+//	  sessions/<id>.json                      会话元数据，临时文件 + rename 原子覆盖
+//	  entries/<esc-ns>/<esc-key>.json         已发布条目（按命名空间隔离），原子覆盖
+//	  namespaces/<esc-name>.json              命名空间配额元数据
+//	  pins/<esc-ns>/<esc-key>.json            固定租约（含版本与块引用快照）
+//	  audit.log                               追加式审计日志（O_APPEND）
 //
 // 重启后状态可完整恢复。
 type FileStore struct {
@@ -30,7 +32,7 @@ type FileStore struct {
 
 // NewFileStore 打开（必要时创建）基于目录的持久化存储。
 func NewFileStore(root string) (*FileStore, error) {
-	for _, sub := range []string{"blobs", "sessions", "entries"} {
+	for _, sub := range []string{"blobs", "sessions", "entries", "namespaces", "pins"} {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("buildcache: init store: %w", err)
 		}
@@ -233,8 +235,8 @@ func escapeKey(k string) string {
 	return repl.Replace(k)
 }
 
-func (s *FileStore) entryPath(key string) string {
-	return filepath.Join(s.root, "entries", escapeKey(key)+".json")
+func (s *FileStore) entryPath(namespace, key string) string {
+	return filepath.Join(s.root, "entries", escapeKey(namespace), escapeKey(key)+".json")
 }
 
 // PutEntry 使用独立的 entry 互斥：读-检查-写整个过程对同键必须串行，
@@ -242,8 +244,8 @@ func (s *FileStore) entryPath(key string) string {
 func (s *FileStore) PutEntry(e Entry, wantVersion int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	path := s.entryPath(e.Key)
-	existing, err := s.readEntry(e.Key)
+	path := s.entryPath(e.Namespace, e.Key)
+	existing, err := s.readEntry(e.Namespace, e.Key)
 	switch {
 	case errors.Is(err, ErrEntryNotFound):
 		if wantVersion >= 0 {
@@ -263,9 +265,9 @@ func (s *FileStore) PutEntry(e Entry, wantVersion int64) error {
 	return s.writeAtomic(path, data, 0o644)
 }
 
-func (s *FileStore) readEntry(key string) (Entry, error) {
+func (s *FileStore) readEntry(namespace, key string) (Entry, error) {
 	var e Entry
-	data, err := os.ReadFile(s.entryPath(key))
+	data, err := os.ReadFile(s.entryPath(namespace, key))
 	if errors.Is(err, os.ErrNotExist) {
 		return Entry{}, ErrEntryNotFound
 	}
@@ -278,40 +280,198 @@ func (s *FileStore) readEntry(key string) (Entry, error) {
 	return e, nil
 }
 
-func (s *FileStore) GetEntry(key string) (Entry, error) { return s.readEntry(key) }
+func (s *FileStore) GetEntry(namespace, key string) (Entry, error) {
+	return s.readEntry(namespace, key)
+}
 
-func (s *FileStore) DeleteEntry(key string) error {
+func (s *FileStore) DeleteEntry(namespace, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := os.Remove(s.entryPath(key))
+	err := os.Remove(s.entryPath(namespace, key))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	return err
 }
 
+// walkEntries 遍历 entries/ 下的全部条目 JSON 并反序列化。
+func (s *FileStore) walkEntries(namespaceOnly string) ([]Entry, error) {
+	root := filepath.Join(s.root, "entries")
+	if namespaceOnly != "" {
+		root = filepath.Join(root, escapeKey(namespaceOnly))
+	}
+	var out []Entry
+	err := filepath.WalkDir(root, func(path string, de os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil // 命名空间目录尚不存在
+			}
+			return err
+		}
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+			return nil
+		}
+		var e Entry
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &e); err != nil {
+			return nil // 容忍临时/异常文件
+		}
+		out = append(out, e)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out, nil
+}
+
 func (s *FileStore) ListEntries() ([]Entry, error) {
-	dir := filepath.Join(s.root, "entries")
+	return s.walkEntries("")
+}
+
+func (s *FileStore) ListNamespaceEntries(namespace string) ([]Entry, error) {
+	return s.walkEntries(namespace)
+}
+
+// ---- 命名空间配额 ----
+
+func (s *FileStore) namespacePath(name string) string {
+	return filepath.Join(s.root, "namespaces", escapeKey(name)+".json")
+}
+
+func (s *FileStore) SaveNamespace(ns Namespace) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(ns, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.namespacePath(ns.Name), data, 0o644)
+}
+
+func (s *FileStore) GetNamespace(name string) (Namespace, error) {
+	var ns Namespace
+	data, err := os.ReadFile(s.namespacePath(name))
+	if errors.Is(err, os.ErrNotExist) {
+		return Namespace{}, ErrNamespaceNotFound
+	}
+	if err != nil {
+		return Namespace{}, err
+	}
+	if err := json.Unmarshal(data, &ns); err != nil {
+		return Namespace{}, err
+	}
+	return ns, nil
+}
+
+func (s *FileStore) ListNamespaces() ([]Namespace, error) {
+	dir := filepath.Join(s.root, "namespaces")
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	var out []Entry
+	var out []Namespace
 	for _, f := range files {
 		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
 			continue
 		}
+		var ns Namespace
 		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
 		if err != nil {
 			return nil, err
 		}
-		var e Entry
-		if err := json.Unmarshal(data, &e); err != nil {
+		if err := json.Unmarshal(data, &ns); err != nil {
 			return nil, err
 		}
-		out = append(out, e)
+		out = append(out, ns)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// ---- 固定租约 ----
+
+func (s *FileStore) pinPath(namespace, key string) string {
+	return filepath.Join(s.root, "pins", escapeKey(namespace), escapeKey(key)+".json")
+}
+
+func (s *FileStore) SavePin(p PinLease) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.pinPath(p.Namespace, p.Key), data, 0o644)
+}
+
+func (s *FileStore) readPin(namespace, key string) (PinLease, error) {
+	var p PinLease
+	data, err := os.ReadFile(s.pinPath(namespace, key))
+	if errors.Is(err, os.ErrNotExist) {
+		return PinLease{}, ErrPinNotFound
+	}
+	if err != nil {
+		return PinLease{}, err
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		return PinLease{}, err
+	}
+	return p, nil
+}
+
+func (s *FileStore) GetPin(namespace, key string) (PinLease, error) {
+	return s.readPin(namespace, key)
+}
+
+func (s *FileStore) DeletePin(namespace, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.Remove(s.pinPath(namespace, key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (s *FileStore) ListPins() ([]PinLease, error) {
+	root := filepath.Join(s.root, "pins")
+	var out []PinLease
+	err := filepath.WalkDir(root, func(path string, de os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+			return nil
+		}
+		var p PinLease
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			return nil
+		}
+		out = append(out, p)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Namespace != out[j].Namespace {
+			return out[i].Namespace < out[j].Namespace
+		}
+		return out[i].Key < out[j].Key
+	})
 	return out, nil
 }
 

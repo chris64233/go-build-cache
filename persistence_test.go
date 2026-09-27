@@ -78,7 +78,7 @@ func TestFileStorePersistence(t *testing.T) {
 	}
 
 	// 已发布条目可读且内容完整。
-	r, err := c2.Read(key)
+	r, err := c2.ReadDefault(key)
 	if err != nil {
 		t.Fatalf("read after restart: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestFileStoreEntryCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := digestOf([]byte("x"))
-	e := Entry{Key: "k", Version: 1, Digest: d, TotalSize: 1, PublishedAt: time.Now()}
+	e := Entry{Namespace: DefaultNamespace, Key: "k", Version: 1, Digest: d, TotalSize: 1, PublishedAt: time.Now()}
 	if err := s1.PutEntry(e, -1); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestFileStoreEntryCAS(t *testing.T) {
 	if err := s1.PutEntry(e2, 1); err != nil {
 		t.Fatalf("CAS update: %v", err)
 	}
-	got, err := s1.GetEntry("k")
+	got, err := s1.GetEntry(DefaultNamespace, "k")
 	if err != nil || got.Version != 2 {
 		t.Fatalf("get = %+v, %v", got, err)
 	}
@@ -238,5 +238,101 @@ func TestFileStoreBlobIntegrity(t *testing.T) {
 	sz, err := s.BlobSize(d)
 	if err != nil || sz != int64(len(data)) {
 		t.Fatalf("size = %d, %v", sz, err)
+	}
+}
+
+// 命名空间配额、固定租约与访问序号在 FileStore 重启后必须完整恢复，
+// 且用量在重启时按实际条目重算。
+func TestFileStoreNamespaceAndPinPersistence(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	clk := NewFakeClock(base)
+	data := []byte("persist pins and quota please")
+
+	func() {
+		store, err := NewFileStore(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := New(store, clk, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.RegisterNamespace("ns", 1234); err != nil {
+			t.Fatal(err)
+		}
+		// 单分片发布。
+		sess, _ := c.CreateSession(CreateSessionOptions{
+			Namespace: "ns", Key: "k", FinalDigest: digestOf(data),
+			TotalSize: int64(len(data)), Chunks: plan(t, data, len(data)),
+		})
+		c.UploadChunk(sess.ID, 0, data)
+		if _, err := c.Complete(sess.ID, CompleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		// 读取两次推进访问序号。
+		r1, _ := c.Read("ns", "k")
+		io.Copy(io.Discard, r1)
+		r1.Close()
+		r2, _ := c.Read("ns", "k")
+		io.Copy(io.Discard, r2)
+		r2.Close()
+		if _, err := c.Pin(PinOptions{
+			Namespace: "ns", Key: "k", ExpectedDigest: digestOf(data), TTL: time.Hour,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// 重启。
+	store2, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := New(store2, clk, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := c2.GetNamespace("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns.MaxBytes != 1234 || ns.UsedBytes != int64(len(data)) {
+		t.Fatalf("namespace after restart = %+v", ns)
+	}
+	lease, err := c2.GetPin("ns", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.Version != 1 || lease.Digest != digestOf(data) || len(lease.Chunks) != 1 {
+		t.Fatalf("pin after restart = %+v", lease)
+	}
+	entry, err := store2.GetEntry("ns", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.AccessSeq != 2 {
+		t.Fatalf("access seq after restart = %d, want 2", entry.AccessSeq)
+	}
+	// 固定保护在重启后仍然有效：同名新访问得到的序号大于 2，淘汰确认能识别。
+	r3, err := c2.Read("ns", "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, r3)
+	r3.Close()
+	entry2, _ := store2.GetEntry("ns", "k")
+	if entry2.AccessSeq != 3 {
+		t.Fatalf("access seq after post-restart read = %d, want 3", entry2.AccessSeq)
+	}
+	// GC 不能删除被固定的块。
+	rep, err := c2.CollectGarbage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, db := range rep.DeletedBlobs {
+		if db.Digest == digestOf(data) {
+			t.Fatalf("pinned blob survived restart but got GC'd")
+		}
 	}
 }

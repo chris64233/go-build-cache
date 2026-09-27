@@ -38,14 +38,27 @@ type Store interface {
 	DeleteSession(id string) error
 	ListSessions() ([]Session, error)
 
-	// ---- 已发布条目 ----
+	// ---- 已发布条目（按命名空间隔离）----
 	// PutEntry 按版本条件原子写入：
-	// wantVersion < 0 表示仅允许新建（键必须不存在）；
+	// wantVersion < 0 表示仅允许新建（命名空间内该键必须不存在）；
 	// wantVersion >=0 表示当前版本必须恰好等于 wantVersion。
 	PutEntry(e Entry, wantVersion int64) error
-	GetEntry(key string) (Entry, error)
-	DeleteEntry(key string) error
+	GetEntry(namespace, key string) (Entry, error)
+	DeleteEntry(namespace, key string) error
 	ListEntries() ([]Entry, error)
+	ListNamespaceEntries(namespace string) ([]Entry, error)
+
+	// ---- 命名空间配额 ----
+	// SaveNamespace 按名字 upsert 命名空间配额元数据。
+	SaveNamespace(ns Namespace) error
+	GetNamespace(name string) (Namespace, error)
+	ListNamespaces() ([]Namespace, error)
+
+	// ---- 固定租约 ----
+	SavePin(p PinLease) error
+	GetPin(namespace, key string) (PinLease, error)
+	DeletePin(namespace, key string) error
+	ListPins() ([]PinLease, error)
 
 	// ---- 审计 ----
 	AppendAudit(rec GCRecord) error
