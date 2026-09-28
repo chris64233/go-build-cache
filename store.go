@@ -74,6 +74,12 @@ type Store interface {
 	ListEvictionDecisions() ([]EvictionDecision, error)
 	DeleteEvictionDecision(id string) error
 
+	// ---- 跨命名空间晋级（请求号幂等记录）----
+	// SavePromotion 以 request_id 为键原子写入（proposed / committed / failed 均覆盖同键记录）。
+	SavePromotion(p Promotion) error
+	GetPromotion(requestID string) (Promotion, error)
+	ListPromotions() ([]Promotion, error)
+
 	// ---- 审计 ----
 	AppendAudit(rec GCRecord) error
 	ListAudit() ([]GCRecord, error)

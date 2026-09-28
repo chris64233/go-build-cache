@@ -110,7 +110,8 @@ func New(store Store, clock Clock, ttl time.Duration) (*Cache, error) {
 	}
 	c := &Cache{
 		store: store, clock: clock, ttl: ttl,
-		idem: make(map[string]string), pinReqs: make(map[string]PinRequest),
+		idem:    make(map[string]string),
+		pinReqs: make(map[string]PinRequest),
 	}
 	if err := c.restoreIndex(); err != nil {
 		return nil, err
@@ -615,7 +616,8 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 			}
 		}
 		// 配额：投影用量 = 当前已用 + 新条目体量；不足则先淘汰未固定 LRU。
-		if decision, err := c.enforceQuotaLocked(ns, sess.Key, 0, sess.TotalSize, now); err != nil {
+		if decision, err := c.enforceQuotaLocked(
+			ns, map[string]bool{sess.Key: true}, 0, sess.TotalSize, now); err != nil {
 			return nil, err
 		} else {
 			entry := Entry{
@@ -659,7 +661,8 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 			}
 		}
 		// 配额：投影用量 = 已用 - 旧版本体量 + 新版本体量。
-		decision, err := c.enforceQuotaLocked(ns, sess.Key, existing.TotalSize, sess.TotalSize, now)
+		decision, err := c.enforceQuotaLocked(
+			ns, map[string]bool{sess.Key: true}, existing.TotalSize, sess.TotalSize, now)
 		if err != nil {
 			return nil, err
 		}
@@ -688,9 +691,10 @@ func (c *Cache) publish(sess *Session, refs []ChunkRef, now time.Time, opts Comp
 }
 
 // enforceQuotaLocked 在发布前确保投影用量不超过配额，必要时执行未固定 LRU 淘汰。
-// excludeKey 是本次发布的键（覆盖自身不应淘汰自己）；oldSize 是被覆盖旧版本体量
+// exclude 中的键不参与淘汰（至少排除本次写入的键）；oldSize 是被覆盖旧版本体量
 // （新建为 0），newSize 是即将发布的体量。调用方持有 c.mu。
-func (c *Cache) enforceQuotaLocked(ns Namespace, excludeKey string, oldSize, newSize int64, now time.Time) (*EvictionDecision, error) {
+func (c *Cache) enforceQuotaLocked(ns Namespace, exclude map[string]bool, oldSize, newSize int64,
+	now time.Time) (*EvictionDecision, error) {
 	if ns.MaxBytes <= 0 {
 		return nil, nil
 	}
@@ -703,7 +707,7 @@ func (c *Cache) enforceQuotaLocked(ns Namespace, excludeKey string, oldSize, new
 		return nil, nil
 	}
 	need := projected - ns.MaxBytes
-	decision, err := c.planEvictionLocked(ns, need, "quota_on_publish", excludeKey, now)
+	decision, err := c.planEvictionLocked(ns, need, "quota_on_publish", exclude, now)
 	if err != nil {
 		return nil, err
 	}
@@ -1299,7 +1303,7 @@ func optVerStr(v *uint64) string {
 
 // PlanEviction 在命名空间内建立一个"未固定 LRU"淘汰决策但不立即删除，
 // 需要释放 needBytes 字节（候选体量按 LRU、键名升序累计到满足为止）。
-// excludeKey 非空时跳过该键（用于发布内部流程）。
+// 发布/晋级内部流程通过持锁内核的 exclude 集合排除自身依赖的键。
 func (c *Cache) PlanEviction(namespace string, needBytes int64) (*EvictionDecision, error) {
 	namespace = normNamespace(namespace)
 	if needBytes <= 0 {
@@ -1311,11 +1315,14 @@ func (c *Cache) PlanEviction(namespace string, needBytes int64) (*EvictionDecisi
 	if err != nil {
 		return nil, err
 	}
-	return c.planEvictionLocked(ns, needBytes, "manual", "", c.clock.Now())
+	return c.planEvictionLocked(ns, needBytes, "manual", nil, c.clock.Now())
 }
 
-func (c *Cache) planEvictionLocked(ns Namespace, needBytes int64, reason, excludeKey string,
-	now time.Time) (*EvictionDecision, error) {
+// planEvictionLocked 建立淘汰决策。exclude 中的键永不成为候选
+// （发布时排除自身；晋级时排除目标键与同命名空间内的来源键——
+// 它们是本次操作依赖的内容，不得淘汰）。调用方持有 c.mu。
+func (c *Cache) planEvictionLocked(ns Namespace, needBytes int64, reason string,
+	exclude map[string]bool, now time.Time) (*EvictionDecision, error) {
 	entries, err := c.store.ListEntries()
 	if err != nil {
 		return nil, err
@@ -1332,7 +1339,7 @@ func (c *Cache) planEvictionLocked(ns Namespace, needBytes int64, reason, exclud
 	}
 	var cands []Entry
 	for _, e := range entries {
-		if e.Namespace != ns.Name || e.Key == excludeKey {
+		if e.Namespace != ns.Name || exclude[e.Key] {
 			continue
 		}
 		if _, isPinned := pinned[e.Key]; isPinned {
@@ -1407,46 +1414,14 @@ func (c *Cache) CommitEviction(decisionID string) (*EvictionDecision, error) {
 }
 
 func (c *Cache) commitEvictionLocked(decision *EvictionDecision, now time.Time) error {
-	pins, err := c.store.ListPins()
+	victims, err := c.evaluateEvictionLocked(decision, now)
 	if err != nil {
 		return err
 	}
-	activePin := make(map[string]Pin)
-	for _, p := range pins {
-		if p.Namespace == decision.Namespace && p.Active(now) {
-			activePin[p.Key] = p
-		}
-	}
-	for i := range decision.Candidates {
-		cand := &decision.Candidates[i]
-		entry, gerr := c.store.GetEntry(decision.Namespace, cand.Key)
-		switch {
-		case errors.Is(gerr, ErrEntryNotFound):
-			cand.Outcome = EvictSkippedMissing
-			continue
-		case gerr != nil:
-			return gerr
-		}
-		// 重新发布：版本或摘要与决策快照不一致。
-		if entry.Version != cand.Version || entry.Digest != cand.Digest {
-			cand.Outcome = EvictSkippedRepublished
-			continue
-		}
-		// 访问：最近访问时间相对决策快照前移。
-		if entry.LastAccessedAt.After(cand.LastAccessedAt) {
-			cand.Outcome = EvictSkippedAccessed
-			continue
-		}
-		// 固定：决策之后获得了有效固定。
-		if _, ok := activePin[cand.Key]; ok {
-			cand.Outcome = EvictSkippedPinned
-			continue
-		}
-		if err := c.store.DeleteEntry(decision.Namespace, cand.Key); err != nil {
+	for _, e := range victims {
+		if err := c.store.DeleteEntry(decision.Namespace, e.Key); err != nil {
 			return err
 		}
-		cand.Outcome = EvictDeleted
-		decision.FreedBytes += cand.Size
 	}
 	decision.Status = EvictionCommitted
 	decision.CommittedAt = now
@@ -1466,6 +1441,55 @@ func (c *Cache) commitEvictionLocked(decision *EvictionDecision, now time.Time) 
 		Detail: fmt.Sprintf("decision=%s phase=committed deleted=%d skipped=%d freed=%d",
 			decision.ID, deleted, skipped, decision.FreedBytes),
 	})
+}
+
+// evaluateEvictionLocked 用最新状态逐个复核淘汰候选并填写 Outcome，
+// 返回判定为"可删除"的候选的完整当前条目（调用方负责真正删除）。
+// 不修改任何条目状态。调用方持有 c.mu。
+func (c *Cache) evaluateEvictionLocked(decision *EvictionDecision, now time.Time) ([]Entry, error) {
+	pins, err := c.store.ListPins()
+	if err != nil {
+		return nil, err
+	}
+	activePin := make(map[string]Pin)
+	for _, p := range pins {
+		if p.Namespace == decision.Namespace && p.Active(now) {
+			activePin[p.Key] = p
+		}
+	}
+	decision.FreedBytes = 0
+	var victims []Entry
+	for i := range decision.Candidates {
+		cand := &decision.Candidates[i]
+		cand.Outcome = EvictPending
+		entry, gerr := c.store.GetEntry(decision.Namespace, cand.Key)
+		switch {
+		case errors.Is(gerr, ErrEntryNotFound):
+			cand.Outcome = EvictSkippedMissing
+			continue
+		case gerr != nil:
+			return nil, gerr
+		}
+		// 重新发布：版本或摘要与决策快照不一致。
+		if entry.Version != cand.Version || entry.Digest != cand.Digest {
+			cand.Outcome = EvictSkippedRepublished
+			continue
+		}
+		// 访问：最近访问时间相对决策快照前移。
+		if entry.LastAccessedAt.After(cand.LastAccessedAt) {
+			cand.Outcome = EvictSkippedAccessed
+			continue
+		}
+		// 固定：决策之后获得了有效固定。
+		if _, ok := activePin[cand.Key]; ok {
+			cand.Outcome = EvictSkippedPinned
+			continue
+		}
+		cand.Outcome = EvictDeleted
+		decision.FreedBytes += cand.Size
+		victims = append(victims, entry)
+	}
+	return victims, nil
 }
 
 // GetEvictionDecision 查询一次淘汰决策（含每个候选的提交结果）。

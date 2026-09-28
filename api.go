@@ -31,6 +31,11 @@ import (
 //	POST   /v1/evictions/{id}/commit          提交淘汰决策
 //	GET    /v1/evictions                      列出淘汰决策
 //	GET    /v1/evictions/{id}                 查询淘汰决策
+//	POST   /v1/promotions                     建立跨命名空间晋级请求（可带 commit 立即提交）
+//	POST   /v1/promotions/{id}/commit         提交晋级请求
+//	GET    /v1/promotions                     列出晋级记录（?namespace=）
+//	GET    /v1/promotions/{id}                查询晋级结果
+//	GET    /v1/promotion-links                条目两端晋级关系（?namespace=&key=）
 //	GET    /v1/blobs/{digest}/refs            内容块引用查询
 //	POST   /v1/gc                             触发一次垃圾回收（含到期固定扫描）
 //	GET    /v1/audit                          查看审计记录
@@ -51,6 +56,9 @@ func NewHandler(c *Cache) *Handler {
 	h.Mux.HandleFunc("/v1/pins/", h.pinSubroute)
 	h.Mux.HandleFunc("/v1/evictions", h.evictionCollection)
 	h.Mux.HandleFunc("/v1/evictions/", h.evictionSubroute)
+	h.Mux.HandleFunc("/v1/promotions", h.promotionCollection)
+	h.Mux.HandleFunc("/v1/promotions/", h.promotionSubroute)
+	h.Mux.HandleFunc("/v1/promotion-links", h.promotionLinks)
 	h.Mux.HandleFunc("/v1/blobs/", h.blobRefs)
 	h.Mux.HandleFunc("/v1/gc", h.collectGC)
 	h.Mux.HandleFunc("/v1/audit", h.audit)
@@ -564,6 +572,8 @@ func writeCacheError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "namespace_not_found", err.Error())
 	case errors.Is(err, ErrPinNotFound):
 		writeError(w, http.StatusNotFound, "pin_not_found", err.Error())
+	case errors.Is(err, ErrPromotionNotFound):
+		writeError(w, http.StatusNotFound, "promotion_not_found", err.Error())
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, ErrLeaseExpired):
@@ -584,9 +594,27 @@ func writeCacheError(w http.ResponseWriter, err error) {
 		var pc *PinConflictError
 		var pvc *PinVersionConflictError
 		var prc *PinRequestConflictError
+		var promc *PromotionConflictError
+		var promrc *PromotionRequestConflictError
+		var proms *PromotionStaleError
 		switch {
 		case errors.As(err, &dm):
 			writeError(w, http.StatusUnprocessableEntity, "digest_mismatch", err.Error())
+		case errors.As(err, &proms):
+			writeError(w, http.StatusPreconditionFailed, "promotion_stale", err.Error())
+		case errors.As(err, &promrc):
+			writeError(w, http.StatusConflict, "promotion_request_conflict", err.Error())
+		case errors.As(err, &promc):
+			switch promc.Reason {
+			case PromotionReasonMissing:
+				writeError(w, http.StatusNotFound, "source_entry_not_found", err.Error())
+			case PromotionReasonDigest:
+				writeError(w, http.StatusPreconditionFailed, "promotion_digest_mismatch", err.Error())
+			case PromotionReasonTargetExists:
+				writeError(w, http.StatusConflict, "promotion_target_exists", err.Error())
+			default:
+				writeError(w, http.StatusConflict, "promotion_conflict", err.Error())
+			}
 		case errors.As(err, &cc):
 			status := http.StatusUnprocessableEntity
 			code := "chunk_conflict"

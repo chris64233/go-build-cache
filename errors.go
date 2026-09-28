@@ -18,6 +18,8 @@ var (
 	ErrPinNotFound = errors.New("buildcache: pin not found")
 	// ErrPinNotActive 固定租约已解除或已过期：不能续租；如需保护请重新固定。
 	ErrPinNotActive = errors.New("buildcache: pin is not active")
+	// ErrPromotionNotFound 晋级请求号不存在。
+	ErrPromotionNotFound = errors.New("buildcache: promotion request not found")
 )
 
 // DigestMismatchError 表示实际计算出的摘要与声明的预期摘要不一致。
@@ -186,4 +188,60 @@ type PinRequestConflictError struct {
 
 func (e *PinRequestConflictError) Error() string {
 	return "buildcache: pin request id " + e.RequestID + " was already used with different parameters"
+}
+
+// PromotionConflictError 表示晋级请求与当前状态冲突，Reason 给出机器可读类别。
+type PromotionConflictError struct {
+	Reason    string
+	RequestID string
+	Detail    string
+}
+
+const (
+	// PromotionReasonMissing 来源命名空间没有该已发布条目。
+	PromotionReasonMissing = "source_missing"
+	// PromotionReasonDigest 来源条目当前摘要与请求预期摘要不符。
+	PromotionReasonDigest = "source_digest_mismatch"
+	// PromotionReasonUploading 来源键在来源命名空间内有正在进行的上传会话，暂不能晋级。
+	PromotionReasonUploading = "source_uploading"
+	// PromotionReasonTargetExists copy 模式下目标键已存在。
+	PromotionReasonTargetExists = "target_exists"
+	// PromotionReasonSameEntry 来源与目标指向同一条目（同命名空间同键）。
+	PromotionReasonSameEntry = "same_entry"
+)
+
+func (e *PromotionConflictError) Error() string {
+	return "buildcache: promotion conflict (" + e.Reason + "): " + e.Detail
+}
+
+// PromotionRequestConflictError 表示相同晋级请求号被用于不同请求内容（指纹不同）。
+type PromotionRequestConflictError struct {
+	RequestID string
+}
+
+func (e *PromotionRequestConflictError) Error() string {
+	return "buildcache: promotion request id " + e.RequestID + " was already used with different parameters"
+}
+
+// PromotionStaleError 表示旧晋级请求依据的状态已经变化，重放必须明确失败
+// 而不能覆盖新状态：来源摘要变化、目标配额版本变化、目标条目已被推进到更新版本。
+type PromotionStaleError struct {
+	Reason    string
+	RequestID string
+	Detail    string
+}
+
+const (
+	// PromotionStaleSource 来源条目摘要相对请求冻结快照已变化。
+	PromotionStaleSource = "source_changed"
+	// PromotionStaleQuota 目标命名空间配额版本相对请求建立时已变化。
+	PromotionStaleQuota = "quota_version_changed"
+	// PromotionStaleTarget replace 模式下目标条目版本相对请求建立时已变化。
+	PromotionStaleTarget = "target_changed"
+	// PromotionStaleEviction 请求内冻结的旧淘汰决定在提交时已失效且无法满足配额。
+	PromotionStaleEviction = "eviction_decision_stale"
+)
+
+func (e *PromotionStaleError) Error() string {
+	return "buildcache: promotion request " + e.RequestID + " is stale (" + e.Reason + "): " + e.Detail
 }

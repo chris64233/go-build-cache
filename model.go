@@ -157,6 +157,8 @@ const (
 	EvictSkippedRepublished = "skipped_republished"
 	// EvictSkippedMissing 提交时条目已不存在。
 	EvictSkippedMissing = "skipped_missing"
+	// EvictSkippedStale 依附的两阶段请求（晋级）在提交时判定过期，整个淘汰决定被放弃。
+	EvictSkippedStale = "skipped_stale"
 )
 
 // EvictionCandidate 是淘汰决策中的单个候选及其提交结果。
@@ -218,6 +220,112 @@ const (
 	RefPin     = "pin"
 )
 
+// 晋级目标模式。
+const (
+	// PromoteCopy 把来源条目复制为目标命名空间下的新键（目标键必须不存在）。
+	PromoteCopy = "copy"
+	// PromoteReplace 替换目标命名空间下的同名旧条目（旧条目不存在时退化为新建）。
+	PromoteReplace = "replace"
+)
+
+// PromotionSource 是晋级请求建立时冻结的来源条目快照：
+// 此后来源条目即使被覆盖发布或删除，本次晋级依据的摘要与内容引用也不变。
+type PromotionSource struct {
+	Namespace string     `json:"namespace"`
+	Key       string     `json:"key"`
+	Version   uint64     `json:"version"`
+	Digest    Digest     `json:"digest"`
+	TotalSize int64      `json:"total_size"`
+	Chunks    []ChunkRef `json:"chunks"`
+}
+
+// Promotion 是一次跨命名空间晋级的持久化记录（请求号幂等）。
+//
+// 晋级在创建请求时冻结来源条目的摘要与内容引用；提交时原子写入目标条目、
+// 提交配额淘汰结果并落定本记录。提交后两端条目共享同一组内容块：
+// 来源条目随后被删除或覆盖，也不会回收仍由目标条目引用的块。
+type Promotion struct {
+	// RequestID 外部请求号，全局唯一，是晋级记录的身份。
+	RequestID string `json:"request_id"`
+	// Mode 目标模式：copy（新键）/ replace（同名覆盖）。
+	Mode string `json:"mode"`
+	// Source 请求建立时冻结的来源条目快照。
+	Source PromotionSource `json:"source"`
+	// TargetNamespace / TargetKey 目标命名空间与目标键。
+	TargetNamespace string `json:"target_namespace"`
+	TargetKey       string `json:"target_key"`
+	// Fingerprint 请求指纹：来源/目标/模式/来源预期摘要。
+	// 同请求号不同指纹一律冲突；来源摘要变化、配额版本变化等"状态漂移"
+	// 不走指纹冲突，而在提交时按 Stale 明确失败。
+	Fingerprint string `json:"fingerprint"`
+	// TargetVersion 请求建立时目标同名条目的版本快照（不存在为 0），
+	// replace 提交时必须仍与之相等，否则旧请求按 target_changed 失败。
+	TargetVersion uint64 `json:"target_version"`
+	// QuotaVersion 提交所依据的目标命名空间配额版本（UpdatedAt.UnixNano()）；
+	// 重放时若目标配额版本已变化，旧请求明确失败。
+	QuotaVersion int64 `json:"quota_version"`
+	// MaxBytes / UsedBefore 请求建立时目标命名空间的配额上限与用量快照。
+	MaxBytes   int64 `json:"max_bytes"`
+	UsedBefore int64 `json:"used_before"`
+	// UsedAfter 提交完成后的目标命名空间实际用量（含淘汰释放）。
+	UsedAfter int64 `json:"used_after,omitempty"`
+	// ResultEntry 提交后目标条目的身份与摘要（copy 恒为 v1；replace 为新版本）。
+	ResultEntry PromotionResultEntry `json:"result_entry"`
+	// ReplacedVersion 被替换旧条目的版本（copy 或旧条目不存在时为 0）。
+	ReplacedVersion uint64 `json:"replaced_version,omitempty"`
+	// SharedChunks 晋级后两端共享的内容块摘要数量（查询用）。
+	SharedChunks int `json:"shared_chunks"`
+	// Eviction 目标配额不足时在创建时算定的淘汰决策（未发生时省略）。
+	// 决策快照在请求建立时形成，提交时逐候选复核：期间被访问/固定/重新发布
+	// 的候选自动跳过；若因此无法满足配额，旧请求按 eviction_decision_stale 失败。
+	Eviction *EvictionDecision `json:"eviction,omitempty"`
+	// FailReason 提交判定为过期（stale）时的机器可读原因；空表示尚未失败。
+	FailReason string `json:"fail_reason,omitempty"`
+	// FailDetail 失败时的人类可读说明（来源/配额/目标如何漂移）。
+	FailDetail  string    `json:"fail_detail,omitempty"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
+	CommittedAt time.Time `json:"committed_at,omitempty"`
+}
+
+// PromotionResultEntry 是晋级提交后目标条目的身份摘要。
+type PromotionResultEntry struct {
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Version   uint64 `json:"version"`
+	Digest    Digest `json:"digest"`
+}
+
+// 晋级记录状态。
+const (
+	// PromotionProposed 请求已建立：来源快照与淘汰候选已冻结，尚未提交。
+	PromotionProposed = "proposed"
+	// PromotionCommitted 晋级已原子提交：目标条目、引用计数（共享块）、淘汰结果落定。
+	PromotionCommitted = "committed"
+	// PromotionFailed 提交时判定旧请求已过期（来源/配额/目标/淘汰决定变化），
+	// 终态；同号重放返回同一失败，绝不覆盖新状态。
+	PromotionFailed = "failed"
+)
+
+// PromotionLink 描述一个条目与另一个命名空间条目之间由晋级建立的共享关系。
+type PromotionLink struct {
+	RequestID    string `json:"request_id"`
+	Namespace    string `json:"namespace"`
+	Key          string `json:"key"`
+	Version      uint64 `json:"version"`
+	Digest       Digest `json:"digest"`
+	SharedChunks int    `json:"shared_chunks"`
+	// Role 该条目在本次晋级中的角色：source / target。
+	Role        string    `json:"role"`
+	CommittedAt time.Time `json:"committed_at"`
+}
+
+// 晋级关系中的角色。
+const (
+	PromotionRoleSource = "source"
+	PromotionRoleTarget = "target"
+)
+
 // GCRecord 是垃圾回收/清理过程留下的可审计决策记录。
 type GCRecord struct {
 	Time       time.Time `json:"time"`
@@ -239,6 +347,7 @@ const (
 	GCSkipInUse    = "blob_skip_in_use"
 	GCPinSwept     = "pin_swept" // 过期固定租约被扫描失效
 	GCEviction     = "eviction"  // 配额淘汰（详情记于 Detail）
+	GCPromotion    = "promotion" // 跨命名空间晋级（详情记于 Detail）
 	GCFinish       = "gc_finish"
 )
 

@@ -24,6 +24,7 @@ import (
 //	  pins/<ns>/<key-escaped>.json      固定租约
 //	  pin_requests/<request-id>.json    固定类请求号幂等记录
 //	  evictions/<id>.json               淘汰决策
+//	  promotions/<request-id>.json      跨命名空间晋级记录
 //	  audit.log                         追加式审计日志（O_APPEND）
 //
 // 重启后状态可完整恢复。
@@ -36,7 +37,7 @@ type FileStore struct {
 func NewFileStore(root string) (*FileStore, error) {
 	for _, sub := range []string{
 		"blobs", "sessions", "namespaces", "entries",
-		"pins", "pin_requests", "evictions",
+		"pins", "pin_requests", "evictions", "promotions",
 	} {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("buildcache: init store: %w", err)
@@ -666,6 +667,62 @@ func (s *FileStore) DeleteEvictionDecision(id string) error {
 		return nil
 	}
 	return err
+}
+
+// ---- 跨命名空间晋级 ----
+
+func (s *FileStore) promotionPath(requestID string) string {
+	return filepath.Join(s.root, "promotions", escapeKey(requestID)+".json")
+}
+
+func (s *FileStore) SavePromotion(p Promotion) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.promotionPath(p.RequestID), data, 0o644)
+}
+
+func (s *FileStore) GetPromotion(requestID string) (Promotion, error) {
+	var p Promotion
+	data, err := os.ReadFile(s.promotionPath(requestID))
+	if errors.Is(err, os.ErrNotExist) {
+		return Promotion{}, ErrNotFound
+	}
+	if err != nil {
+		return Promotion{}, err
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		return Promotion{}, err
+	}
+	return p, nil
+}
+
+func (s *FileStore) ListPromotions() ([]Promotion, error) {
+	dir := filepath.Join(s.root, "promotions")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Promotion
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		var p Promotion
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RequestID < out[j].RequestID })
+	return out, nil
 }
 
 // ---- 审计日志（每行一条 JSON，原子追加）----

@@ -18,6 +18,7 @@ type MemoryStore struct {
 	pins       map[string]Pin
 	pinReqs    map[string]PinRequest
 	decisions  map[string]EvictionDecision
+	promotions map[string]Promotion
 	audit      []GCRecord
 }
 
@@ -31,6 +32,7 @@ func NewMemoryStore() *MemoryStore {
 		pins:       make(map[string]Pin),
 		pinReqs:    make(map[string]PinRequest),
 		decisions:  make(map[string]EvictionDecision),
+		promotions: make(map[string]Promotion),
 	}
 }
 
@@ -331,6 +333,36 @@ func (m *MemoryStore) DeleteEvictionDecision(id string) error {
 	return nil
 }
 
+// ---- 跨命名空间晋级 ----
+
+func (m *MemoryStore) SavePromotion(p Promotion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promotions[p.RequestID] = clonePromotion(p)
+	return nil
+}
+
+func (m *MemoryStore) GetPromotion(requestID string) (Promotion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.promotions[requestID]
+	if !ok {
+		return Promotion{}, ErrNotFound
+	}
+	return clonePromotion(p), nil
+}
+
+func (m *MemoryStore) ListPromotions() ([]Promotion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Promotion, 0, len(m.promotions))
+	for _, p := range m.promotions {
+		out = append(out, clonePromotion(p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RequestID < out[j].RequestID })
+	return out, nil
+}
+
 func (m *MemoryStore) AppendAudit(rec GCRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -373,5 +405,15 @@ func clonePin(p Pin) Pin {
 func cloneDecision(d EvictionDecision) EvictionDecision {
 	cp := d
 	cp.Candidates = append([]EvictionCandidate(nil), d.Candidates...)
+	return cp
+}
+
+func clonePromotion(p Promotion) Promotion {
+	cp := p
+	cp.Source.Chunks = append([]ChunkRef(nil), p.Source.Chunks...)
+	if p.Eviction != nil {
+		d := cloneDecision(*p.Eviction)
+		cp.Eviction = &d
+	}
 	return cp
 }

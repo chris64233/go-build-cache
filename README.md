@@ -1,8 +1,9 @@
 # go-build-cache
 
 内容寻址（content-addressed）的构建制品缓存：支持分片上传、租约管理、原子发布、
-乐观并发控制、**命名空间配额与 LRU 淘汰**、**可续租的缓存固定（pin）**以及
-标记-清除垃圾回收。所有元数据持久化，进程重启后可完整恢复。
+乐观并发控制、**命名空间配额与 LRU 淘汰**、**可续租的缓存固定（pin）**、
+**跨命名空间条目晋级（promotion，共享内容块）**以及标记-清除垃圾回收。
+所有元数据持久化，进程重启后可完整恢复。
 
 开发环境：Go 1.23.0。
 
@@ -85,6 +86,53 @@
   解除或过期后下一次 GC 才回收。固定**不阻止**条目本身的覆盖发布，只影响配额淘汰
   与块回收。
 
+### 跨命名空间晋级（promotion）：内容块共享、配额淘汰、旧请求不覆盖新状态
+
+晋级把一个**已发布来源条目**提升到另一个命名空间，目标可以**复制为新键**
+（`copy`，目标键必须不存在）或**替换同名旧条目**（`replace`，版本递增；
+旧条目不存在时退化为新建）。
+
+晋级是**两阶段请求**（`CreatePromotion` → `CommitPromotion`），也可用
+`Promote` 在一次调用内原子完成（典型路径）：
+
+- **建立（create）时冻结**来源条目的当前摘要与内容块引用快照（`PromotionSource`）、
+  目标配额版本（命名空间 `updated_at`）、目标同名条目版本，并**按目标配额算定
+  淘汰候选**。冻结后来源条目即使被覆盖发布或删除，本次晋级依据也不变。
+- **拒绝建立**的情形：来源条目不存在（`source_missing`）、来源摘要与
+  `expected_digest` 不符（`source_digest_mismatch`）、来源键存在未过期的
+  open 上传会话（`source_uploading`）、`copy` 模式目标键已存在
+  （`target_exists`）、来源与目标指向同一条目（`same_entry`）。
+- **提交（commit）前逐项复核**，任一状态漂移都让旧请求**明确失败**
+  （`PromotionStaleError`，记录进入 `failed` 终态），绝不覆盖新状态：
+  - 来源摘要变化（或来源消失）→ `source_changed`；
+  - 目标命名空间配额版本 / 上限变化 → `quota_version_changed`；
+  - `replace` 目标条目被推进（或 `copy` 目标键出现）→ `target_changed`；
+  - 冻结的淘汰决定在提交时已腾不出足够空间 → `eviction_decision_stale`。
+- **淘汰候选保护**：提交时逐候选用最新状态复核——提交期间被**重新访问**
+  （LRU 时间前移）、**固定**或**重新发布**的候选一律跳过（沿用淘汰决定的
+  `skipped_accessed` / `skipped_pinned` / `skipped_republished` 语义）；
+  有效固定项永不淘汰。整个旧决定因此失效、无法满足配额时，晋级失败且
+  **不删除任何条目**，这些候选记为 `skipped_stale`。
+- **本次晋级依赖的内容不被淘汰**：目标写入键被排除；同命名空间内复制时，
+  来源键也被排除，避免"删掉自己依赖的内容"。
+- **原子提交**：目标条目（存储层 CAS 条件兜底）→ 删除淘汰条目 → 落定淘汰决定
+  → 落定晋级记录 → 审计，全部在同一把服务锁内；任一步持久化失败都会**完整
+  回滚**（恢复被覆盖旧目标与被删候选、记录退回 `proposed`），保持两端原状，
+  解除故障后可用同一请求号重试。
+- **内容块跨命名空间共享**：目标条目直接引用来源的同一组 blob，引用由 GC 统一
+  按 `entry / session / pin` 计数。来源条目之后被删除或覆盖，也**不会回收**
+  仍由目标引用的块；两端都消失后下一次 GC 才回收。
+- **请求号幂等**：相同 `request_id` + 相同请求指纹返回**首次结果**（成功返回
+  同一目标条目；失败返回同一 stale 错误）；相同请求号 + 不同内容（指纹不同）
+  返回 `PromotionRequestConflictError`。配额版本变化属于"状态漂移"而非指纹
+  变化，只影响尚未提交的请求。
+
+晋级结果可通过 `GetPromotion(requestID)` / `ListPromotions(namespace)` 查询，
+其中含目标条目身份、被替换版本、两端共享块数、配额前后用量（`used_before` /
+`used_after`）与随附的淘汰决定；某个条目与另一端条目的共享关系用
+`PromotionLinks(namespace, key)` 查询；内容块的跨命名空间引用仍由
+`BlobReferences(digest)` 给出（同一块会出现两条 `entry` 引用）。
+
 ### 租约与统一时钟
 
 - 所有"当前时间"一律取自 `Clock` 接口（生产用 `SystemClock`，测试用 `FakeClock`），
@@ -117,15 +165,20 @@ GC 快照之前（块被标记保留），要么只能发生在 GC 之后；不�
 - **固定租约**：`GetPin(ns,key)` 取单个租约；`ListPins(namespace, activeOnly)` 列出。
 - **淘汰决定**：`GetEvictionDecision(id)` / `ListEvictionDecisions(namespace)`
   返回每次决策及逐候选结果。
+- **晋级**：`GetPromotion(requestID)` / `ListPromotions(namespace)` 返回晋级结果、
+  被替换版本、共享块数、配额前后用量与随附淘汰决定；
+  `PromotionLinks(namespace, key)` 返回一个条目与另一端条目的晋级共享关系。
 - **内容引用**：`BlobReferences(digest)` 返回某块当前的全部引用（`entry` /
   `session` / `pin`），并标注引用是否仍有效（会话是否 open 未过期、固定是否未到期）。
+  晋级后同一块会被来源与目标两个 `entry` 引用。
 
 ## 代码结构
 
 | 文件 | 职责 |
 | --- | --- |
 | `cache.go` | `Cache` 服务：会话/发布/配额淘汰/固定/清理/GC/查询，全部并发控制 |
-| `model.go` | `Namespace` / `Pin` / `PinRequest` / `EvictionDecision` / `Entry` 等持久化元数据 |
+| `promotion.go` | 跨命名空间晋级：两阶段建立/提交、冻结快照、配额淘汰复核、原子落定与回滚、查询 |
+| `model.go` | `Namespace` / `Pin` / `PinRequest` / `EvictionDecision` / `Promotion` / `Entry` 等持久化元数据 |
 | `digest.go` | 摘要类型与校验（`sha256:hex`） |
 | `clock.go` | `Clock` / `SystemClock` / `FakeClock` 统一时间来源 |
 | `errors.go` | 按类别区分的错误：摘要、分片、租约、版本、配额、固定冲突 |
@@ -133,7 +186,7 @@ GC 快照之前（块被标记保留），要么只能发生在 GC 之后；不�
 | `memory_store.go` | 进程内实现（测试用） |
 | `file_store.go` | 文件持久化实现：临时文件 + `rename` 原子写，重启恢复，旧版条目迁移到默认命名空间 |
 | `reader.go` | 按分片顺序拼接的已发布条目读取器 |
-| `api.go` | HTTP 接口与错误码映射 |
+| `api.go` / `api_promotion.go` | HTTP 接口与错误码映射 / 晋级与两端关系端点 |
 | `cmd/buildcached/main.go` | 可运行服务，带可选后台 GC 与默认配额参数 |
 
 ## HTTP 接口
@@ -153,6 +206,9 @@ GC 快照之前（块被标记保留），要么只能发生在 GC 之后；不�
 | GET | `/v1/pins/{namespace}/{key...}` | 查询单个固定租约 |
 | POST/GET | `/v1/evictions` | 建立淘汰决策（`{"namespace","need_bytes"}`）/ 列出决策 |
 | POST/GET | `/v1/evictions/{id}/commit`、`/v1/evictions/{id}` | 提交决策 / 查询决策 |
+| POST/GET | `/v1/promotions` | 建立晋级（可 `commit:false` 只建立；缺省建立并原子提交）/ 列出晋级（`?namespace=`） |
+| POST/GET | `/v1/promotions/{id}/commit`、`/v1/promotions/{id}` | 提交晋级请求 / 查询晋级结果 |
+| GET | `/v1/promotion-links?namespace=&key=` | 查询条目与另一端条目的晋级共享关系 |
 | GET | `/v1/blobs/{digest}/refs` | 查询内容块的全部引用 |
 | POST | `/v1/gc` | 同步执行一次垃圾回收（含到期固定扫描），返回决策报告 |
 | GET | `/v1/audit` | 查看审计记录 |
@@ -175,15 +231,36 @@ GC 快照之前（块被标记保留），要么只能发生在 GC 之后；不�
 续租用 `{"action":"renew","extend_seconds":900,...}`，解除用
 `{"action":"unpin",...}`；截止时间也可用 RFC3339 的 `deadline` 绝对时间指定。
 
+晋级请求 body 示例（缺省建立并原子提交；传 `"commit": false` 只建立，
+之后调用 `/v1/promotions/{id}/commit`）：
+
+```json
+{
+  "source_namespace": "staging",
+  "source_key": "mod/github.com/x/y@v1.2.3",
+  "expected_digest": "sha256:...",
+  "target_namespace": "release",
+  "target_key": "mod/github.com/x/y@v1.2.3",
+  "mode": "copy",
+  "request_id": "promo-req-0001"
+}
+```
+
+`mode` 为 `copy`（复制为新键，目标键必须不存在）或 `replace`（替换同名旧条目）。
+目标键省略时与来源键同名。
+
 错误响应统一为 `{"error": "<code>", "message": "..."}`，典型状态码：
 
 | 场景 | HTTP | error code |
 | --- | --- | --- |
-| 会话 / 条目 / 命名空间 / 固定不存在 | 404 | `session_not_found` / `entry_not_found` / `namespace_not_found` / `pin_not_found` |
+| 会话 / 条目 / 命名空间 / 固定 / 晋级不存在 | 404 | `session_not_found` / `entry_not_found` / `namespace_not_found` / `pin_not_found` / `promotion_not_found` / `source_entry_not_found` |
 | 租约过期 | 410 | `lease_expired` |
 | 会话已完成/取消、幂等键冲突、固定不活跃、固定版本冲突、请求号冲突 | 409 | `session_not_active` / `idempotency_conflict` / `pin_not_active` / `pin_version_conflict` / `pin_request_conflict` |
 | 摘要/分片内容冲突、缺片 | 422 / 409 | `digest_mismatch` / `chunk_conflict` / `chunks_incomplete` |
 | 版本条件 / 固定摘要不匹配 | 412 | `version_conflict` / `pin_digest_conflict` |
+| 晋级来源摘要漂移、配额版本变化、目标被推进、旧淘汰决定失效 | 412 | `promotion_stale` |
+| 晋级来源摘要与请求不符 | 412 | `promotion_digest_mismatch` |
+| 晋级 copy 目标已存在、晋级请求号异内容冲突、来源正在上传 | 409 | `promotion_target_exists` / `promotion_request_conflict` / `promotion_conflict` |
 | 命名空间配额不足（LRU 也腾不出空间） | 507 | `quota_exceeded` |
 
 ## 使用示例（Go API）
@@ -227,6 +304,17 @@ r, _ := cache.Read("team-a", "mod/github.com/x/y@v1.2.3")
 defer r.Close()
 io.Copy(os.Stdout, r)
 
+// 把已发布条目从 staging 晋级到 release（两命名空间共享同一组内容块）。
+prom, err := cache.Promote(buildcache.PromoteOptions{
+    SourceNamespace: "staging", SourceKey: "mod/github.com/x/y@v1.2.3",
+    ExpectedDigest:  res.Entry.Digest,
+    TargetNamespace: "release", TargetKey: "mod/github.com/x/y@v1.2.3",
+    Mode:            buildcache.PromoteCopy, RequestID: "promo-req-1",
+})
+// prom.ResultEntry / prom.UsedAfter / prom.Eviction 给出目标条目、配额变化与淘汰结果。
+_ = prom
+links, _ := cache.PromotionLinks("staging", "mod/github.com/x/y@v1.2.3") // 两端关系
+
 st, _ := cache.NamespaceStatus("team-a")                 // 配额占用
 refs, _ := cache.BlobReferences(res.Entry.Chunks[0].Digest) // 内容块被谁引用
 report, _ := cache.CollectGarbage()                       // 只回收无三类引用的块
@@ -259,4 +347,21 @@ go test -race ./...        # 含竞态检测（含 GC、并发发布、并发固
     拒、过期扫描不复活、重新固定得到更高版本、请求号同内容回放/异内容冲突；
   - 块回收：固定快照在覆盖发布后保留旧块、解除后回收、过期固定失效；
   - 查询：配额状态、固定租约列表、淘汰决策、内容块三类引用查询；
-  - HTTP：命名空间配额与 507、固定全生命周期与错误码、淘汰 plan/commit、块引用查询。
+  - HTTP：命名空间配额与 507、固定全生命周期与错误码、淘汰 plan/commit、块引用查询；
+- 晋级（本轮新增）：
+  - copy / replace（含目标缺省新建）基础晋级、两端共享块、来源删除后目标内容与块
+    存活、两端都删除后块才回收；
+  - 前置校验：来源缺失 / 摘要不符 / 正在上传 / copy 目标已存在 / 同源同键 /
+    目标命名空间不存在；
+  - 目标配额淘汰：未固定 LRU 生效、固定项豁免、全固定时失败且不删数据、
+    同命名空间复制时来源键不被淘汰、`used_before`/`used_after` 正确；
+  - 两阶段失效：提交期间候选被访问 / 固定 / 重新发布使旧淘汰决定失效，来源摘要
+    变化、目标配额版本变化、replace 目标版本推进分别返回对应 stale 原因；
+  - 请求号幂等：同号同内容返回首次结果、提交幂等、同号异内容冲突；
+  - 原子性：在删除候选 / 落定淘汰决定 / 落定晋级记录 / 写审计各点注入持久化失败，
+    验证两端原状恢复、记录退回 proposed 且解除故障后重试成功；
+  - 持久化：FileStore 重启后晋级记录、两端关系、共享块与 proposed 请求可恢复，
+    重启后同号重放返回首次结果；
+  - 并发：多 goroutine 晋级 + 发布对打，目标配额不被突破、存活条目内容完整；
+  - 查询与 HTTP：晋级结果 / 列表 / 两端关系 / 块跨命名空间引用查询，
+    两阶段 412 `promotion_stale`、各类 404/409 错误码、随晋级返回的淘汰决定。
