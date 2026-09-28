@@ -18,6 +18,8 @@ var (
 	ErrPinNotFound = errors.New("buildcache: pin not found")
 	// ErrPinNotActive 固定租约已解除或已过期：不能续租；如需保护请重新固定。
 	ErrPinNotActive = errors.New("buildcache: pin is not active")
+	// ErrPromotionNotFound 晋级决策不存在。
+	ErrPromotionNotFound = errors.New("buildcache: promotion not found")
 )
 
 // DigestMismatchError 表示实际计算出的摘要与声明的预期摘要不一致。
@@ -186,4 +188,68 @@ type PinRequestConflictError struct {
 
 func (e *PinRequestConflictError) Error() string {
 	return "buildcache: pin request id " + e.RequestID + " was already used with different parameters"
+}
+
+// PromotionDigestConflictError 表示晋级请求指定的来源摘要与该来源键当前已发布条目的
+// 摘要不一致：晋级不得作用于摘要不匹配的条目。
+type PromotionDigestConflictError struct {
+	Namespace      string
+	Key            string
+	ExpectedDigest Digest // 请求要求的来源摘要
+	CurrentDigest  Digest // 当前来源条目摘要
+}
+
+func (e *PromotionDigestConflictError) Error() string {
+	return "buildcache: promotion source digest mismatch for " + e.Namespace + "/" + e.Key +
+		": want " + e.ExpectedDigest.String() + ", current " + e.CurrentDigest.String()
+}
+
+// PromotionConflictError 表示晋级请求与当前状态冲突：
+//   - Reason "uploading"：来源键存在未完成上传会话，来源内容尚不稳定，不得晋级；
+//   - Reason "target_exists"：copy 模式目标键已存在；
+//   - Reason "same_digest"：目标已存在相同摘要条目（无需晋级）；
+//   - Reason "same_namespace"：来源与目标命名空间相同。
+type PromotionConflictError struct {
+	Namespace string
+	Key       string
+	Reason    string
+	Detail    string
+}
+
+const (
+	// PromotionReasonUploading 来源条目正在上传（存在未完成会话）。
+	PromotionReasonUploading = "uploading"
+	// PromotionReasonTargetExists copy 模式目标键已存在。
+	PromotionReasonTargetExists = "target_exists"
+	// PromotionReasonSameDigest 目标已存在相同摘要条目。
+	PromotionReasonSameDigest = "same_digest"
+	// PromotionReasonSameNamespace 来源与目标命名空间相同。
+	PromotionReasonSameNamespace = "same_namespace"
+)
+
+func (e *PromotionConflictError) Error() string {
+	return "buildcache: promotion conflict for " + e.Namespace + "/" + e.Key +
+		": " + e.Reason + " " + e.Detail
+}
+
+// PromotionStaleError 表示一个已建立（prepared）的晋级在提交时其决策依据已失效：
+// 来源摘要/版本变化、目标配额版本变化或旧淘汰决定失效。旧请求必须明确失败，
+// 而不是按新状态覆盖；调用方应按当前状态重新发起晋级。
+type PromotionStaleError struct {
+	PromotionID string
+	Reason      string // PromotionFail* 常量
+	Detail      string
+}
+
+func (e *PromotionStaleError) Error() string {
+	return "buildcache: promotion " + e.PromotionID + " stale: " + e.Reason + " " + e.Detail
+}
+
+// PromotionRequestConflictError 表示相同晋级请求号被用于不同请求内容（指纹不同）。
+type PromotionRequestConflictError struct {
+	RequestID string
+}
+
+func (e *PromotionRequestConflictError) Error() string {
+	return "buildcache: promotion request id " + e.RequestID + " was already used with different parameters"
 }

@@ -31,6 +31,10 @@ import (
 //	POST   /v1/evictions/{id}/commit          提交淘汰决策
 //	GET    /v1/evictions                      列出淘汰决策
 //	GET    /v1/evictions/{id}                 查询淘汰决策
+//	POST   /v1/promotions                     建立跨命名空间晋级（可 "commit":true 一并提交）
+//	POST   /v1/promotions/{id}/commit         提交晋级
+//	GET    /v1/promotions                     列出晋级（?namespace=&request_id=&status=）
+//	GET    /v1/promotions/{id}                查询晋级详情（两端关系/配额/内容来源）
 //	GET    /v1/blobs/{digest}/refs            内容块引用查询
 //	POST   /v1/gc                             触发一次垃圾回收（含到期固定扫描）
 //	GET    /v1/audit                          查看审计记录
@@ -51,6 +55,8 @@ func NewHandler(c *Cache) *Handler {
 	h.Mux.HandleFunc("/v1/pins/", h.pinSubroute)
 	h.Mux.HandleFunc("/v1/evictions", h.evictionCollection)
 	h.Mux.HandleFunc("/v1/evictions/", h.evictionSubroute)
+	h.Mux.HandleFunc("/v1/promotions", h.promotionCollection)
+	h.Mux.HandleFunc("/v1/promotions/", h.promotionSubroute)
 	h.Mux.HandleFunc("/v1/blobs/", h.blobRefs)
 	h.Mux.HandleFunc("/v1/gc", h.collectGC)
 	h.Mux.HandleFunc("/v1/audit", h.audit)
@@ -499,6 +505,93 @@ func (h *Handler) evictionSubroute(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---- 跨命名空间晋级 ----
+
+func (h *Handler) promotionCollection(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		ps, err := h.Cache.ListPromotions(PromotionFilters{
+			Namespace: r.URL.Query().Get("namespace"),
+			RequestID: r.URL.Query().Get("request_id"),
+			Status:    r.URL.Query().Get("status"),
+		})
+		if err != nil {
+			writeCacheError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, ps)
+	case http.MethodPost:
+		var req struct {
+			SourceNamespace string `json:"source_namespace"`
+			SourceKey       string `json:"source_key"`
+			SourceDigest    string `json:"source_digest"`
+			TargetNamespace string `json:"target_namespace"`
+			TargetKey       string `json:"target_key"`
+			Mode            string `json:"mode"`
+			RequestID       string `json:"request_id,omitempty"`
+			// Commit 缺省为 true：建立后在同一临界区内立即提交。
+			// 显式 false 时只建立（prepared），需要随后调用 commit。
+			Commit *bool `json:"commit,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+			return
+		}
+		d, err := ParseDigest(req.SourceDigest)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_digest", err.Error())
+			return
+		}
+		opts := PromoteOptions{
+			SourceNamespace: req.SourceNamespace, SourceKey: req.SourceKey,
+			ExpectedDigest:  d,
+			TargetNamespace: req.TargetNamespace, TargetKey: req.TargetKey,
+			Mode: req.Mode, RequestID: req.RequestID,
+		}
+		if req.Commit != nil && !*req.Commit {
+			p, err := h.Cache.PreparePromotion(opts)
+			if err != nil {
+				writeCacheError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, p)
+			return
+		}
+		p, err := h.Cache.Promote(opts)
+		if err != nil {
+			writeCacheError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, p)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use GET or POST")
+	}
+}
+
+func (h *Handler) promotionSubroute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/promotions/")
+	parts := strings.Split(rest, "/")
+	switch {
+	case len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet:
+		// 默认返回完整详情（结果 + 两端关系 + 配额变化 + 内容来源）。
+		detail, err := h.Cache.GetPromotionDetail(parts[0])
+		if err != nil {
+			writeCacheError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+	case len(parts) == 2 && parts[1] == "commit" && r.Method == http.MethodPost:
+		p, err := h.Cache.CommitPromotion(parts[0])
+		if err != nil {
+			writeCacheError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "unknown promotion route")
+	}
+}
+
 // ---- 内容引用查询 ----
 
 func (h *Handler) blobRefs(w http.ResponseWriter, r *http.Request) {
@@ -564,6 +657,8 @@ func writeCacheError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "namespace_not_found", err.Error())
 	case errors.Is(err, ErrPinNotFound):
 		writeError(w, http.StatusNotFound, "pin_not_found", err.Error())
+	case errors.Is(err, ErrPromotionNotFound):
+		writeError(w, http.StatusNotFound, "promotion_not_found", err.Error())
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, ErrLeaseExpired):
@@ -584,6 +679,10 @@ func writeCacheError(w http.ResponseWriter, err error) {
 		var pc *PinConflictError
 		var pvc *PinVersionConflictError
 		var prc *PinRequestConflictError
+		var proDC *PromotionDigestConflictError
+		var proC *PromotionConflictError
+		var proS *PromotionStaleError
+		var proRC *PromotionRequestConflictError
 		switch {
 		case errors.As(err, &dm):
 			writeError(w, http.StatusUnprocessableEntity, "digest_mismatch", err.Error())
@@ -607,6 +706,25 @@ func writeCacheError(w http.ResponseWriter, err error) {
 			writeError(w, http.StatusConflict, "pin_version_conflict", err.Error())
 		case errors.As(err, &prc):
 			writeError(w, http.StatusConflict, "pin_request_conflict", err.Error())
+		case errors.As(err, &proDC):
+			writeError(w, http.StatusPreconditionFailed, "promotion_digest_conflict", err.Error())
+		case errors.As(err, &proS):
+			writeError(w, http.StatusConflict, "promotion_stale:"+proS.Reason, err.Error())
+		case errors.As(err, &proRC):
+			writeError(w, http.StatusConflict, "promotion_request_conflict", err.Error())
+		case errors.As(err, &proC):
+			code := "promotion_conflict"
+			switch proC.Reason {
+			case PromotionReasonUploading:
+				code = "source_uploading"
+			case PromotionReasonTargetExists:
+				code = "promotion_target_exists"
+			case PromotionReasonSameDigest:
+				code = "promotion_same_digest"
+			case PromotionReasonSameNamespace:
+				code = "promotion_same_endpoint"
+			}
+			writeError(w, http.StatusConflict, code, err.Error())
 		case errors.As(err, &pc):
 			switch pc.Reason {
 			case PinReasonNoEntry:

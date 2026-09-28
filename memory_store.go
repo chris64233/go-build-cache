@@ -18,6 +18,9 @@ type MemoryStore struct {
 	pins       map[string]Pin
 	pinReqs    map[string]PinRequest
 	decisions  map[string]EvictionDecision
+	promotions map[string]Promotion
+	promoReqs  map[string]PromotionRequest
+	promoTxns  map[string]PromotionTxn
 	audit      []GCRecord
 }
 
@@ -31,6 +34,9 @@ func NewMemoryStore() *MemoryStore {
 		pins:       make(map[string]Pin),
 		pinReqs:    make(map[string]PinRequest),
 		decisions:  make(map[string]EvictionDecision),
+		promotions: make(map[string]Promotion),
+		promoReqs:  make(map[string]PromotionRequest),
+		promoTxns:  make(map[string]PromotionTxn),
 	}
 }
 
@@ -331,6 +337,110 @@ func (m *MemoryStore) DeleteEvictionDecision(id string) error {
 	return nil
 }
 
+// ---- 晋级 ----
+
+func (m *MemoryStore) SavePromotion(p Promotion) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promotions[p.ID] = clonePromotion(p)
+	return nil
+}
+
+func (m *MemoryStore) GetPromotion(id string) (Promotion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.promotions[id]
+	if !ok {
+		return Promotion{}, ErrPromotionNotFound
+	}
+	return clonePromotion(p), nil
+}
+
+func (m *MemoryStore) ListPromotions() ([]Promotion, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Promotion, 0, len(m.promotions))
+	for _, p := range m.promotions {
+		out = append(out, clonePromotion(p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (m *MemoryStore) DeletePromotion(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.promotions, id)
+	return nil
+}
+
+// ---- 晋级请求号 ----
+
+func (m *MemoryStore) SavePromotionRequest(rec PromotionRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promoReqs[rec.RequestID] = rec
+	return nil
+}
+
+func (m *MemoryStore) GetPromotionRequest(requestID string) (PromotionRequest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.promoReqs[requestID]
+	if !ok {
+		return PromotionRequest{}, ErrNotFound
+	}
+	return rec, nil
+}
+
+func (m *MemoryStore) ListPromotionRequests() ([]PromotionRequest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]PromotionRequest, 0, len(m.promoReqs))
+	for _, rec := range m.promoReqs {
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RequestID < out[j].RequestID })
+	return out, nil
+}
+
+// ---- 晋级提交重做日志 ----
+
+func (m *MemoryStore) SavePromotionTxn(txn PromotionTxn) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.promoTxns[txn.PromotionID] = txn
+	return nil
+}
+
+func (m *MemoryStore) GetPromotionTxn(promotionID string) (PromotionTxn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	txn, ok := m.promoTxns[promotionID]
+	if !ok {
+		return PromotionTxn{}, ErrNotFound
+	}
+	return txn, nil
+}
+
+func (m *MemoryStore) ListPromotionTxns() ([]PromotionTxn, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]PromotionTxn, 0, len(m.promoTxns))
+	for _, txn := range m.promoTxns {
+		out = append(out, txn)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PromotionID < out[j].PromotionID })
+	return out, nil
+}
+
+func (m *MemoryStore) DeletePromotionTxn(promotionID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.promoTxns, promotionID)
+	return nil
+}
+
 func (m *MemoryStore) AppendAudit(rec GCRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -373,5 +483,15 @@ func clonePin(p Pin) Pin {
 func cloneDecision(d EvictionDecision) EvictionDecision {
 	cp := d
 	cp.Candidates = append([]EvictionCandidate(nil), d.Candidates...)
+	return cp
+}
+
+func clonePromotion(p Promotion) Promotion {
+	cp := p
+	cp.SourceChunks = append([]ChunkRef(nil), p.SourceChunks...)
+	if p.Eviction != nil {
+		e := cloneDecision(*p.Eviction)
+		cp.Eviction = &e
+	}
 	return cp
 }

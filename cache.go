@@ -94,6 +94,8 @@ type Cache struct {
 	gcGen   uint64 // GC 代次，重启后由审计日志恢复
 	// evictSeq 淘汰决策序号，重启后由已持久化决策恢复。
 	evictSeq uint64
+	// promoSeq 晋级决策序号，重启后由已持久化晋级恢复。
+	promoSeq uint64
 }
 
 // New 创建缓存服务。clock 为 nil 时使用 SystemClock；store 由调用方提供。
@@ -153,6 +155,15 @@ func (c *Cache) restoreIndex() error {
 			c.evictSeq = n
 		}
 	}
+	promotions, err := c.store.ListPromotions()
+	if err != nil {
+		return fmt.Errorf("buildcache: restore promotions: %w", err)
+	}
+	for _, p := range promotions {
+		if n := promotionSeqOf(p.ID); n > c.promoSeq {
+			c.promoSeq = n
+		}
+	}
 	// 默认命名空间：不存在则注册为不限配额。
 	if _, err := c.store.GetNamespace(DefaultNamespace); errors.Is(err, ErrNotFound) {
 		now := c.clock.Now()
@@ -164,6 +175,10 @@ func (c *Cache) restoreIndex() error {
 	} else if err != nil {
 		return err
 	}
+	// 重做崩溃前未完成的晋级提交（必须在默认命名空间确保之后，以便两端命名空间可解析）。
+	if err := c.resumePromotionTxns(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -172,6 +187,22 @@ func idemComposite(namespace, key string) string { return namespace + "\x00" + k
 // evictionSeqOf 从决策 ID（"evict-<零填充序号>"）解析序号；无法识别时返回 0。
 func evictionSeqOf(id string) uint64 {
 	const prefix = "evict-"
+	if len(id) <= len(prefix) || id[:len(prefix)] != prefix {
+		return 0
+	}
+	var n uint64
+	for _, ch := range id[len(prefix):] {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		n = n*10 + uint64(ch-'0')
+	}
+	return n
+}
+
+// promotionSeqOf 从晋级 ID（"promo-<零填充序号>"）解析序号；无法识别时返回 0。
+func promotionSeqOf(id string) uint64 {
+	const prefix = "promo-"
 	if len(id) <= len(prefix) || id[:len(prefix)] != prefix {
 		return 0
 	}
@@ -1499,13 +1530,17 @@ func (c *Cache) ListEvictionDecisions(namespace string) ([]EvictionDecision, err
 
 // ---- 内容引用查询 ----
 
-// BlobReferences 查询一个内容块当前被哪些已发布条目、活跃上传或有效固定引用。
-// 会话类引用以 Active 标识该会话是否仍 open 且未过期；已发布条目引用恒为 active。
+// BlobReferences 查询一个内容块当前被哪些已发布条目、活跃上传、有效固定或
+// prepared 晋级快照引用。会话类引用以 Active 标识该会话是否仍 open 且未过期；
+// 已发布条目引用恒为 active；prepared 晋级快照在提交/失败前恒为 active。
 func (c *Cache) BlobReferences(digest Digest) ([]BlobReference, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	now := c.clock.Now()
+	return c.blobReferencesLocked(digest, c.clock.Now())
+}
 
+// blobReferencesLocked 是 BlobReferences 的持锁实现，供晋级详情查询复用。
+func (c *Cache) blobReferencesLocked(digest Digest, now time.Time) ([]BlobReference, error) {
 	var refs []BlobReference
 	entries, err := c.store.ListEntries()
 	if err != nil {
@@ -1564,6 +1599,31 @@ func (c *Cache) BlobReferences(digest Digest) ([]BlobReference, error) {
 			Kind: RefPin, Namespace: p.Namespace, Key: p.Key,
 			Version: p.Version, Active: p.Active(now),
 			Detail: fmt.Sprintf("pin v%d status=%s deadline=%s", p.Version, p.Status, p.Deadline.Format(time.RFC3339Nano)),
+		})
+	}
+	promotions, err := c.store.ListPromotions()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range promotions {
+		if p.Status != PromotionPrepared {
+			continue
+		}
+		found := false
+		for _, ref := range p.SourceChunks {
+			if ref.Digest == digest {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		refs = append(refs, BlobReference{
+			Kind: RefPromotion, Namespace: p.SourceNamespace, Key: p.SourceKey,
+			Version: p.SourceVersion, Active: true,
+			Detail: fmt.Sprintf("prepared promotion=%s target=%s/%s request=%s",
+				p.ID, p.TargetNamespace, p.TargetKey, p.RequestID),
 		})
 	}
 	return refs, nil
@@ -1648,6 +1708,20 @@ func (c *Cache) buildLiveSet(now time.Time) (map[string]struct{}, error) {
 			live[ref.Digest.String()] = struct{}{}
 		}
 	}
+	promotions, err := c.store.ListPromotions()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range promotions {
+		if p.Status != PromotionPrepared {
+			continue
+		}
+		// prepared 晋级冻结的来源快照是第四类存活引用：即使来源条目随后被删除，
+		// 晋级提交依赖的内容块仍受保护，直到提交完成或旧请求被判定失败。
+		for _, ref := range p.SourceChunks {
+			live[ref.Digest.String()] = struct{}{}
+		}
+	}
 	return live, nil
 }
 
@@ -1690,7 +1764,20 @@ func (c *Cache) deathReason(d Digest, now time.Time) string {
 			}
 		}
 	}
-	return "not referenced by any published key, active session, or active pin"
+	promotions, err := c.store.ListPromotions()
+	if err == nil {
+		for _, p := range promotions {
+			if p.Status != PromotionPrepared {
+				continue
+			}
+			for _, ref := range p.SourceChunks {
+				if ref.Digest == d {
+					return ""
+				}
+			}
+		}
+	}
+	return "not referenced by any published key, active session, active pin, or prepared promotion"
 }
 
 func (c *Cache) computeFinalDigest(sess Session) (Digest, error) {

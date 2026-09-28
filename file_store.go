@@ -24,6 +24,9 @@ import (
 //	  pins/<ns>/<key-escaped>.json      固定租约
 //	  pin_requests/<request-id>.json    固定类请求号幂等记录
 //	  evictions/<id>.json               淘汰决策
+//	  promotions/<id>.json              跨命名空间晋级决策与结果
+//	  promo_requests/<request-id>.json  晋级外部请求号幂等记录
+//	  promo_txns/<id>.json              晋级提交重做日志
 //	  audit.log                         追加式审计日志（O_APPEND）
 //
 // 重启后状态可完整恢复。
@@ -37,6 +40,7 @@ func NewFileStore(root string) (*FileStore, error) {
 	for _, sub := range []string{
 		"blobs", "sessions", "namespaces", "entries",
 		"pins", "pin_requests", "evictions",
+		"promotions", "promo_requests", "promo_txns",
 	} {
 		if err := os.MkdirAll(filepath.Join(root, sub), 0o755); err != nil {
 			return nil, fmt.Errorf("buildcache: init store: %w", err)
@@ -662,6 +666,194 @@ func (s *FileStore) DeleteEvictionDecision(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	err := os.Remove(s.decisionPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// ---- 跨命名空间晋级 ----
+
+func (s *FileStore) promotionPath(id string) string {
+	return filepath.Join(s.root, "promotions", escapeKey(id)+".json")
+}
+
+func (s *FileStore) SavePromotion(p Promotion) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.promotionPath(p.ID), data, 0o644)
+}
+
+func (s *FileStore) GetPromotion(id string) (Promotion, error) {
+	var p Promotion
+	data, err := os.ReadFile(s.promotionPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return Promotion{}, ErrPromotionNotFound
+	}
+	if err != nil {
+		return Promotion{}, err
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		return Promotion{}, err
+	}
+	return p, nil
+}
+
+func (s *FileStore) ListPromotions() ([]Promotion, error) {
+	dir := filepath.Join(s.root, "promotions")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Promotion
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		var p Promotion
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func (s *FileStore) DeletePromotion(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.Remove(s.promotionPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// ---- 晋级请求号 ----
+
+func (s *FileStore) promoRequestPath(id string) string {
+	return filepath.Join(s.root, "promo_requests", escapeKey(id)+".json")
+}
+
+func (s *FileStore) SavePromotionRequest(rec PromotionRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.promoRequestPath(rec.RequestID), data, 0o644)
+}
+
+func (s *FileStore) GetPromotionRequest(requestID string) (PromotionRequest, error) {
+	var rec PromotionRequest
+	data, err := os.ReadFile(s.promoRequestPath(requestID))
+	if errors.Is(err, os.ErrNotExist) {
+		return PromotionRequest{}, ErrNotFound
+	}
+	if err != nil {
+		return PromotionRequest{}, err
+	}
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return PromotionRequest{}, err
+	}
+	return rec, nil
+}
+
+func (s *FileStore) ListPromotionRequests() ([]PromotionRequest, error) {
+	dir := filepath.Join(s.root, "promo_requests")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []PromotionRequest
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		var rec PromotionRequest
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].RequestID < out[j].RequestID })
+	return out, nil
+}
+
+// ---- 晋级提交重做日志 ----
+
+func (s *FileStore) promoTxnPath(id string) string {
+	return filepath.Join(s.root, "promo_txns", escapeKey(id)+".json")
+}
+
+func (s *FileStore) SavePromotionTxn(txn PromotionTxn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := json.MarshalIndent(txn, "", "  ")
+	if err != nil {
+		return err
+	}
+	return s.writeAtomic(s.promoTxnPath(txn.PromotionID), data, 0o644)
+}
+
+func (s *FileStore) GetPromotionTxn(promotionID string) (PromotionTxn, error) {
+	var txn PromotionTxn
+	data, err := os.ReadFile(s.promoTxnPath(promotionID))
+	if errors.Is(err, os.ErrNotExist) {
+		return PromotionTxn{}, ErrNotFound
+	}
+	if err != nil {
+		return PromotionTxn{}, err
+	}
+	if err := json.Unmarshal(data, &txn); err != nil {
+		return PromotionTxn{}, err
+	}
+	return txn, nil
+}
+
+func (s *FileStore) ListPromotionTxns() ([]PromotionTxn, error) {
+	dir := filepath.Join(s.root, "promo_txns")
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []PromotionTxn
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+			continue
+		}
+		var txn PromotionTxn
+		data, err := os.ReadFile(filepath.Join(dir, f.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, &txn); err != nil {
+			return nil, err
+		}
+		out = append(out, txn)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PromotionID < out[j].PromotionID })
+	return out, nil
+}
+
+func (s *FileStore) DeletePromotionTxn(promotionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := os.Remove(s.promoTxnPath(promotionID))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}

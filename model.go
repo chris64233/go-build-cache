@@ -74,6 +74,19 @@ type Entry struct {
 	// LastAccessedAt 最近一次访问时间：读取命中或同摘要重新发布都会刷新，
 	// 是配额淘汰 LRU 排序与淘汰决定复核的依据。
 	LastAccessedAt time.Time `json:"last_accessed_at"`
+	// PromotedFrom 非 nil 时表示该条目由一次跨命名空间晋级建立（或最近一次覆盖来自晋级），
+	// 记录来源条目身份与外部请求号，用于两端关系与内容来源查询。
+	PromotedFrom *PromotionOrigin `json:"promoted_from,omitempty"`
+}
+
+// PromotionOrigin 是目标条目上的晋级来源标记（内容血缘）。
+type PromotionOrigin struct {
+	RequestID string `json:"request_id"`
+	// Namespace / Key / Version / Digest 为来源条目在晋级提交时的冻结身份。
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Version   uint64 `json:"version"`
+	Digest    Digest `json:"digest"`
 }
 
 // Namespace 是配额单位：命名空间内全部已发布条目总字节数不得超过 MaxBytes
@@ -141,6 +154,141 @@ const (
 	PinActionPin   = "pin"
 	PinActionRenew = "renew"
 	PinActionUnpin = "unpin"
+)
+
+// 晋级模式：目标键如何写入。
+const (
+	// PromotionModeCopy 在目标命名空间复制为新键；目标键必须不存在。
+	PromotionModeCopy = "copy"
+	// PromotionModeReplace 替换目标命名空间下同名旧条目；旧条目必须不存在或摘要不同。
+	PromotionModeReplace = "replace"
+)
+
+// 晋级生命周期状态。
+const (
+	// PromotionPrepared 晋级已建立：来源快照与淘汰候选已冻结，等待提交。
+	// prepared 晋级的来源块快照作为 GC 的第四类引用，保护本次晋级依赖的内容。
+	PromotionPrepared = "prepared"
+	// PromotionCommitted 晋级已原子提交：目标条目、淘汰结果、请求记录已落盘。
+	PromotionCommitted = "committed"
+	// PromotionFailed 晋级因来源变化 / 配额版本变化 / 旧淘汰失效 / 配额不足而明确失败；
+	// 不覆盖任何新状态，可通过查询取回失败原因。
+	PromotionFailed = "failed"
+)
+
+// 晋级失败原因（机器可读）。
+const (
+	// PromotionFailSourceChanged 提交时来源条目版本或摘要相对冻结快照变化（被覆盖发布/删除重建）。
+	PromotionFailSourceChanged = "source_changed"
+	// PromotionFailUploading 建立时来源键存在未完成的上传会话，来源内容尚未稳定发布。
+	PromotionFailUploading = "source_uploading"
+	// PromotionFailQuotaVersion 提交时目标命名空间配额（max_bytes）相对决策时变化。
+	PromotionFailQuotaVersion = "quota_version_changed"
+	// PromotionFailEvictionStale 提交时淘汰候选被访问/固定/重新发布/删除，旧淘汰决定失效。
+	PromotionFailEvictionStale = "eviction_stale"
+	// PromotionFailQuota 崩溃恢复重做时，按实际用量复核发现淘汰后空间仍不足。
+	PromotionFailQuota = "quota_exceeded"
+	// PromotionFailTargetConflict 提交时目标键版本/摘要相对冻结基线变化（被并发覆盖）。
+	PromotionFailTargetConflict = "target_conflict"
+)
+
+// PromotionQuota 是晋级决策时目标配额的乐观版本快照：max_bytes + 命名空间 UpdatedAt。
+// 提交时若目标配额的这两个值变化，旧晋级请求明确失败而非按新配额覆盖。
+type PromotionQuota struct {
+	MaxBytes  int64     `json:"max_bytes"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Promotion 是一次跨命名空间条目的晋级决策与结果（两阶段：prepare → commit）。
+//
+// 建立（prepare）时冻结：
+//   - 来源条目的版本/摘要/内容块引用（Source*）；
+//   - 目标配额版本（Quota）；
+//   - 目标键当前状态与目标写入版本条件；
+//   - 按目标配额算出的淘汰候选（Eviction）。
+//
+// 提交（commit）时在同一把服务锁内先复核再原子完成：提交配套淘汰 → 写入目标条目（CAS）
+// → 记录结果。prepared 状态的来源块快照受 GC 保护，因此即使来源条目随后被删除，晋级
+// 依赖的内容仍在（提交以冻结快照完成）；任一步持久化失败时通过重做日志恢复。
+type Promotion struct {
+	// ID 晋级决策 ID（"promo-<零填充序号>"）。
+	ID string `json:"id"`
+	// RequestID 外部请求号；相同请求号 + 相同内容返回首次结果，同号异内容冲突。
+	RequestID string `json:"request_id,omitempty"`
+
+	// SourceNamespace / SourceKey 来源条目身份。
+	SourceNamespace string `json:"source_namespace"`
+	SourceKey       string `json:"source_key"`
+	// SourceVersion / SourceDigest / SourceSize / SourceChunks 为建立时冻结的来源快照。
+	SourceVersion uint64     `json:"source_version"`
+	SourceDigest  Digest     `json:"source_digest"`
+	SourceSize    int64      `json:"source_size"`
+	SourceChunks  []ChunkRef `json:"source_chunks"`
+
+	// TargetNamespace / TargetKey 目标条目身份。
+	TargetNamespace string `json:"target_namespace"`
+	TargetKey       string `json:"target_key"`
+	// Mode copy / replace。
+	Mode string `json:"mode"`
+	// TargetBaseVersion 提交时目标键必须处于的条目版本：copy 为 0（不存在），
+	// replace 为建立时旧条目版本（旧条目不存在时为 0）。
+	TargetBaseVersion uint64 `json:"target_base_version"`
+	// TargetExistingDigest 建立时目标旧条目摘要（不存在为空）。
+	TargetExistingDigest Digest `json:"target_existing_digest,omitempty"`
+	// TargetExistingSize 建立时目标旧条目体量（不存在为 0），用于恢复时按实际用量复核配额。
+	TargetExistingSize int64 `json:"target_existing_size,omitempty"`
+
+	// Quota 建立时目标配额版本快照。
+	Quota PromotionQuota `json:"quota"`
+	// UsedBefore 建立时目标命名空间已用字节。
+	UsedBefore int64 `json:"used_before"`
+	// UsedAfter 提交后目标命名空间已用字节（仅 committed 后填充）。
+	UsedAfter int64 `json:"used_after,omitempty"`
+
+	// Eviction 提交前按目标配额计算的淘汰决策（不需要淘汰时省略）。
+	Eviction *EvictionDecision `json:"eviction,omitempty"`
+
+	// Status prepared / committed / failed。
+	Status     string `json:"status"`
+	FailReason string `json:"fail_reason,omitempty"`
+	// TargetVersion 提交后目标条目版本（copy 为 1，replace 为旧版本+1）。
+	TargetVersion uint64    `json:"target_version,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	CommittedAt   time.Time `json:"committed_at,omitempty"`
+}
+
+// PromotionRequest 记录晋级外部请求号（幂等）：相同请求号 + 相同请求指纹返回首次结果；
+// 相同请求号 + 不同指纹按冲突拒绝。即使首次结果是 failed，也记录并原样回放。
+type PromotionRequest struct {
+	RequestID   string `json:"request_id"`
+	Fingerprint string `json:"fingerprint"`
+	// PromotionID 首次结果对应的晋级决策 ID。
+	PromotionID string    `json:"promotion_id"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// PromotionTxn 是晋级提交的重做日志（WAL）。仅当提交真正开始（通过全部校验、
+// 即将产生首个变更）时才创建；因此"只建立未提交"的 prepared 晋级在重启后仍保持
+// prepared，不会被自动提交；而存在该日志说明提交在进行中崩溃，恢复时重做。
+//
+// 每个阶段完成后推进 Phase 并 fsync；恢复时结合实际状态（淘汰是否已 committed、
+// 目标条目是否已带晋级标记）跳过已完成步骤，最终 Promotion 进入 committed。
+// 任一步持久化失败都沿同一序列重试，已提交端不会回滚、未提交端不留痕。
+type PromotionTxn struct {
+	PromotionID string `json:"promotion_id"`
+	// Phase committing / eviction_committed / entry_written。
+	Phase     string    `json:"phase"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// PromotionTxn 阶段值。
+const (
+	// promoTxnCommitting 提交已开始，首个变更（淘汰）尚未确认完成。
+	promoTxnCommitting = "committing"
+	// promoTxnEviction 配套淘汰已提交。
+	promoTxnEviction = "eviction_committed"
+	// promoTxnEntry 目标条目已写入。
+	promoTxnEntry = "entry_written"
 )
 
 // 淘汰候选在提交（commit）阶段的复核结果。
@@ -213,9 +361,10 @@ type BlobReference struct {
 
 // 内容引用来源。
 const (
-	RefEntry   = "entry"
-	RefSession = "session"
-	RefPin     = "pin"
+	RefEntry     = "entry"
+	RefSession   = "session"
+	RefPin       = "pin"
+	RefPromotion = "promotion" // prepared 晋级的冻结来源快照（跨命名空间内容保护）
 )
 
 // GCRecord 是垃圾回收/清理过程留下的可审计决策记录。
@@ -239,6 +388,7 @@ const (
 	GCSkipInUse    = "blob_skip_in_use"
 	GCPinSwept     = "pin_swept" // 过期固定租约被扫描失效
 	GCEviction     = "eviction"  // 配额淘汰（详情记于 Detail）
+	GCPromotion    = "promotion" // 跨命名空间晋级（准备/提交/失败，详情记于 Detail）
 	GCFinish       = "gc_finish"
 )
 

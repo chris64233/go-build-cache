@@ -74,6 +74,23 @@ type Store interface {
 	ListEvictionDecisions() ([]EvictionDecision, error)
 	DeleteEvictionDecision(id string) error
 
+	// ---- 跨命名空间晋级（两阶段、可审计）----
+	SavePromotion(p Promotion) error
+	GetPromotion(id string) (Promotion, error)
+	ListPromotions() ([]Promotion, error)
+	DeletePromotion(id string) error
+
+	// ---- 晋级外部请求号（幂等记录）----
+	SavePromotionRequest(rec PromotionRequest) error
+	GetPromotionRequest(requestID string) (PromotionRequest, error)
+	ListPromotionRequests() ([]PromotionRequest, error)
+
+	// ---- 晋级提交重做日志（崩溃恢复）----
+	SavePromotionTxn(txn PromotionTxn) error
+	GetPromotionTxn(promotionID string) (PromotionTxn, error)
+	ListPromotionTxns() ([]PromotionTxn, error)
+	DeletePromotionTxn(promotionID string) error
+
 	// ---- 审计 ----
 	AppendAudit(rec GCRecord) error
 	ListAudit() ([]GCRecord, error)
